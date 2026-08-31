@@ -85,7 +85,7 @@ return view.extend({
 		o.validate = validateHttpUrl;
 
 		o = s.taboption('uot', form.Flag, 'udp_over_tcp', _('Включить UDP over TCP'),
-			_('TCP идёт через naive, UDP — через Shadowsocks 2022 UoT внутри того же туннеля. Требуются sing-box и серверный приёмник.'));
+			_('TCP идёт через naive, UDP — через Shadowsocks 2022 UoT внутри того же туннеля. Используйте установщик с --uot; приёмник с тем же ключом нужен на каждом сервере.'));
 		o.default = '0';
 
 		o = s.taboption('uot', form.Value, 'uot_psk', _('Общий ключ UoT'),

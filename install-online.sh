@@ -25,7 +25,12 @@ extract_file 'install.sh' '0755' <<'__NAIVE_ORCH_FILE_0__'
 # Usage (on the router):
 #   sh install.sh            # install files and dependencies
 #   sh install.sh --enable   # also enable and start the service
+#   sh install.sh --enable --uot  # install sing-box and enable UDP over TCP
 #   sh install.sh --skip-naive  # do not download the official naive binary
+#
+# Optional environment:
+#   NAIVE_ORCH_UOT_PSK='<base64 16-byte key>' sh install.sh --enable --uot
+#   NAIVE_ORCH_UOT_METHOD='2022-blake3-aes-128-gcm'
 #
 # Safe by design: binds only to 127.0.0.1, the sample node is disabled,
 # nothing touches firewall / DNS / nftables.
@@ -35,11 +40,14 @@ set -e
 SRC_DIR="$(cd "$(dirname "$0")" && pwd)/root"
 ENABLE=0
 INSTALL_NAIVE="${NAIVE_ORCH_INSTALL_NAIVE:-1}"
+INSTALL_UOT="${NAIVE_ORCH_INSTALL_UOT:-0}"
+UOT_PSK_EFFECTIVE=""
 PKG_UPDATED=0
 
 for arg in "$@"; do
 	case "$arg" in
 		--enable) ENABLE=1 ;;
+		--uot) INSTALL_UOT=1 ;;
 		--skip-naive) INSTALL_NAIVE=0 ;;
 		*) echo "ERROR: unknown option: $arg" >&2; exit 2 ;;
 	esac
@@ -186,8 +194,141 @@ download_naive() {
 	rm -rf "$api_dir"
 }
 
+download_sing_box() {
+	local arch api_dir api_file package_ext package_name package_url package_digest package_file
+
+	[ -x /usr/bin/sing-box ] && {
+		msg "==> sing-box is already installed"
+		return 0
+	}
+
+	# Prefer the configured OpenWrt repository. If it does not provide sing-box,
+	# install the matching package from the official SagerNet release.
+	if pkg_install sing-box; then
+		[ -x /usr/bin/sing-box ] || {
+			echo "ERROR: sing-box package installed but /usr/bin/sing-box is missing" >&2
+			exit 1
+		}
+		return 0
+	fi
+	warn "sing-box is unavailable in the configured package feeds; using the official release"
+
+	arch=""
+	[ -r /etc/openwrt_release ] && . /etc/openwrt_release
+	arch="${DISTRIB_ARCH:-}"
+	[ -n "$arch" ] || {
+		echo "ERROR: cannot determine OpenWrt package architecture for sing-box" >&2
+		exit 1
+	}
+
+	if command -v apk >/dev/null 2>&1; then
+		package_ext="apk"
+	else
+		package_ext="ipk"
+	fi
+
+	api_dir="$(mktemp -d /tmp/naive-orch-sing-box.XXXXXX)"
+	api_file="$api_dir/release.json"
+	curl -fsSL --retry 3 --connect-timeout 10 \
+		-o "$api_file" https://api.github.com/repos/SagerNet/sing-box/releases/latest
+
+	package_name="$(sed -n 's/.*"name": "\([^"]*_openwrt_'"$arch"'\.'"$package_ext"'\)".*/\1/p' "$api_file" | head -n 1)"
+	[ -n "$package_name" ] || {
+		rm -rf "$api_dir"
+		echo "ERROR: the latest sing-box release has no OpenWrt package for '$arch'" >&2
+		exit 1
+	}
+
+	package_url="$(sed -n 's|.*"browser_download_url": "\([^"]*/'"$package_name"'\)".*|\1|p' "$api_file" | head -n 1)"
+	package_digest="$(awk -v wanted="\"name\": \"$package_name\"" '
+		index($0, wanted) { found=1 }
+		found && /"digest": "sha256:/ {
+			sub(/.*"digest": "sha256:/, ""); sub(/".*/, ""); print; exit
+		}
+		found && /"browser_download_url":/ { exit }
+	' "$api_file")"
+	[ -n "$package_url" ] && [ -n "$package_digest" ] || {
+		rm -rf "$api_dir"
+		echo "ERROR: sing-box release metadata is missing URL or SHA-256" >&2
+		exit 1
+	}
+
+	package_file="$api_dir/$package_name"
+	curl -fL --retry 3 --connect-timeout 10 -o "$package_file" "$package_url"
+	printf '%s  %s\n' "$package_digest" "$package_file" | sha256sum -c - >/dev/null || {
+		rm -rf "$api_dir"
+		echo "ERROR: sing-box package checksum mismatch" >&2
+		exit 1
+	}
+
+	if [ "$package_ext" = "apk" ]; then
+		# The package is verified against GitHub's release digest above.
+		apk add --allow-untrusted "$package_file"
+	else
+		opkg install "$package_file"
+	fi
+	rm -rf "$api_dir"
+	[ -x /usr/bin/sing-box ] || {
+		echo "ERROR: /usr/bin/sing-box is missing after installation" >&2
+		exit 1
+	}
+}
+
+generate_uot_psk() {
+	local bytes="$1"
+	if command -v openssl >/dev/null 2>&1; then
+		openssl rand -base64 "$bytes" | tr -d '\r\n'
+	elif command -v base64 >/dev/null 2>&1 && [ -r /dev/urandom ]; then
+		dd if=/dev/urandom bs="$bytes" count=1 2>/dev/null | base64 | tr -d '\r\n'
+	else
+		echo "ERROR: cannot generate UoT PSK; install openssl-util or provide NAIVE_ORCH_UOT_PSK" >&2
+		return 1
+	fi
+}
+
+valid_uot_psk() {
+	local psk="$1" expected_size="$2" decoded_size
+	case "$psk" in *[!A-Za-z0-9+/=]*) return 1 ;; esac
+	decoded_size="$(printf '%s' "$psk" | base64 -d 2>/dev/null | wc -c | tr -d ' ')"
+	[ "$decoded_size" = "$expected_size" ]
+}
+
+configure_uot() {
+	local psk method key_size
+	[ "$INSTALL_UOT" = "1" ] || return 0
+
+	method="${NAIVE_ORCH_UOT_METHOD:-}"
+	[ -n "$method" ] || method="$(uci -q get naive-orch.@global[0].uot_method 2>/dev/null || true)"
+	[ -n "$method" ] || method='2022-blake3-aes-128-gcm'
+	case "$method" in
+		2022-blake3-aes-128-gcm) key_size=16 ;;
+		2022-blake3-aes-256-gcm) key_size=32 ;;
+		*) echo "ERROR: unsupported UoT method: $method" >&2; exit 1 ;;
+	esac
+
+	psk="${NAIVE_ORCH_UOT_PSK:-}"
+	[ -n "$psk" ] || psk="$(uci -q get naive-orch.@global[0].uot_psk 2>/dev/null || true)"
+	[ -n "$psk" ] || psk="$(generate_uot_psk "$key_size")"
+	valid_uot_psk "$psk" "$key_size" || {
+		echo "ERROR: UoT PSK must be a base64-encoded $key_size-byte key for $method" >&2
+		exit 1
+	}
+
+	uci set naive-orch.@global[0].udp_over_tcp='1'
+	uci set naive-orch.@global[0].uot_psk="$psk"
+	uci -q get naive-orch.@global[0].uot_port >/dev/null || \
+		uci set naive-orch.@global[0].uot_port='8388'
+	uci set naive-orch.@global[0].uot_method="$method"
+	uci -q get naive-orch.@global[0].uot_offset >/dev/null || \
+		uci set naive-orch.@global[0].uot_offset='1000'
+	uci commit naive-orch
+	chmod 0600 /etc/config/naive-orch
+	UOT_PSK_EFFECTIVE="$psk"
+}
+
 ensure_dependencies
 download_naive
+[ "$INSTALL_UOT" = "1" ] && download_sing_box
 
 msg "==> Installing naive-orch from $SRC_DIR"
 
@@ -232,6 +373,8 @@ if [ -d "$SRC_DIR/usr/share/luci" ]; then
 	echo "    LuCI: Services -> Naive Orchestrator (refresh browser)"
 fi
 
+configure_uot
+
 msg "==> Checking installation"
 [ -x /usr/bin/naive ] && echo "    naive binary: OK (/usr/bin/naive)" \
 	|| warn "/usr/bin/naive is missing; nodes cannot start"
@@ -253,6 +396,13 @@ echo ""
 msg "Installation complete"
 echo "Open LuCI -> Services -> Naive Orchestrator -> Settings"
 echo "Add a subscription URL, save it, then update it on the Status tab."
+if [ "$INSTALL_UOT" = "1" ]; then
+	echo ""
+	msg "UDP over TCP mode enabled"
+	echo "Shared UoT PSK: $UOT_PSK_EFFECTIVE"
+	echo "Install the UoT receiver with this same PSK on EVERY proxy server."
+	echo "Server installer: https://raw.githubusercontent.com/FurstFri/naive-orch/main/server/uot-server-install.sh"
+fi
 __NAIVE_ORCH_FILE_0__
 
 extract_file 'root/etc/config/naive-orch' '0644' <<'__NAIVE_ORCH_FILE_1__'
@@ -694,7 +844,7 @@ no_render_wrapper() {
       "method": "$method", "password": "$psk",
       "udp_over_tcp": { "enabled": true, "version": 2 }, "detour": "naive" }
   ],
-  "route": { "rules": [ { "network": "udp", "outbound": "ss-uot" } ], "final": "naive" }
+  "route": { "rules": [ { "network": "udp", "action": "route", "outbound": "ss-uot" } ], "final": "naive" }
 }
 EOF
 	chmod 0600 "$f"
@@ -1748,7 +1898,7 @@ return view.extend({
 		o.validate = validateHttpUrl;
 
 		o = s.taboption('uot', form.Flag, 'udp_over_tcp', _('Включить UDP over TCP'),
-			_('TCP идёт через naive, UDP — через Shadowsocks 2022 UoT внутри того же туннеля. Требуются sing-box и серверный приёмник.'));
+			_('TCP идёт через naive, UDP — через Shadowsocks 2022 UoT внутри того же туннеля. Используйте установщик с --uot; приёмник с тем же ключом нужен на каждом сервере.'));
 		o.default = '0';
 
 		o = s.taboption('uot', form.Value, 'uot_psk', _('Общий ключ UoT'),

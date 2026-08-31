@@ -31,7 +31,30 @@ sing-box-приёмником обратно в UDP.
 
 ## Установка
 
-Выполните на OpenWrt:
+### UDP over TCP
+
+Если нужен UoT, выполните на OpenWrt:
+
+```sh
+wget -qO- https://raw.githubusercontent.com/FurstFri/naive-orch/main/install-online.sh | sh -s -- --uot
+```
+
+Этот режим устанавливает официальный `naiveproxy`, `sing-box` и LuCI-приложение,
+создаёт общий PSK и включает UDP over TCP. В конце установщик покажет PSK — он
+понадобится для серверов.
+
+Затем выполните на каждом сервере NaiveProxy:
+
+```sh
+wget -qO- https://raw.githubusercontent.com/FurstFri/naive-orch/main/server/uot-server-install.sh | sh
+```
+
+Скрипт попросит вставить PSK, установит отдельный UoT-приёмник и закроет его порт
+от внешних подключений. Без приёмника на сервере TCP работает, UDP — нет.
+
+### Только TCP
+
+Если UDP не нужен, выполните на OpenWrt:
 
 ```sh
 wget -qO- https://raw.githubusercontent.com/FurstFri/naive-orch/main/install-online.sh | sh
@@ -39,13 +62,15 @@ wget -qO- https://raw.githubusercontent.com/FurstFri/naive-orch/main/install-onl
 
 Установщик:
 
-- устанавливает `curl`, `ca-bundle`, `rpcd-mod-file`, `luci-base` и `xz-utils`;
+- устанавливает необходимые системные пакеты;
 - загружает официальный OpenWrt-билд naiveproxy для архитектуры роутера;
-- проверяет SHA-256 архива naiveproxy;
+- в режиме `--uot` устанавливает подходящий OpenWrt-билд `sing-box`;
+- проверяет SHA-256 загружаемых файлов;
 - сохраняет существующий `/etc/config/naive-orch` при обновлении;
 - устанавливает LuCI-приложение, включает и запускает сервис.
 
-Для обновления запустите ту же команду ещё раз.
+Для обновления запустите ту же команду ещё раз. Существующие настройки и UoT-ключ
+сохраняются.
 
 ## Первая настройка
 
@@ -91,7 +116,7 @@ TCP → naive → сервер → интернет
 UDP → sing-box UoT → naive → серверный sing-box → интернет
 ```
 
-Режим выключен по умолчанию. Для его работы необходимы:
+Для его работы необходимы:
 
 - `sing-box` на OpenWrt;
 - одинаковый Shadowsocks 2022 PSK на роутере и серверах;
@@ -100,14 +125,15 @@ UDP → sing-box UoT → naive → серверный sing-box → интерн�
 Если хотя бы на одном сервере из пула нет UoT-приёмника, TCP через него продолжит
 работать, а UDP — нет.
 
-Серверный установщик находится в
-[`server/uot-server-install.sh`](server/uot-server-install.sh). Параметры режима
-задаются в **Settings → UDP over TCP**.
+Режим устанавливается командой с `--uot`. Серверный установщик находится в
+[`server/uot-server-install.sh`](server/uot-server-install.sh), параметры — в
+**Settings → UDP over TCP**.
 
 ## Безопасность
 
 - SOCKS-порты по умолчанию слушают только `127.0.0.1`;
-- проект не изменяет firewall, nftables, DNS и правила маршрутизации;
+- установщик роутера не изменяет firewall, nftables, DNS и правила маршрутизации;
+- серверный UoT-установщик разрешает порт приёмника только самому серверу;
 - рабочие JSON-конфиги хранятся в tmpfs с правами `0600`;
 - пароли прокси не выводятся в LuCI целиком.
 
@@ -117,6 +143,7 @@ UDP → sing-box UoT → naive → серверный sing-box → интерн�
 
 ```sh
 sh tests/smoke.sh
+sh tests/release-metadata.sh
 ```
 
 После изменения `install.sh` или файлов в `root/` пересоберите автономный

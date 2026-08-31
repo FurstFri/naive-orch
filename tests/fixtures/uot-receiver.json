@@ -1,0 +1,14 @@
+{
+  "log": { "level": "warn" },
+  "inbounds": [
+    {
+      "type": "shadowsocks",
+      "tag": "ss-uot",
+      "listen": "127.0.0.1",
+      "listen_port": 8388,
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "AAAAAAAAAAAAAAAAAAAAAA=="
+    }
+  ],
+  "outbounds": [ { "type": "direct", "tag": "direct" } ]
+}

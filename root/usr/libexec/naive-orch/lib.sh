@@ -92,7 +92,7 @@ no_render_wrapper() {
       "method": "$method", "password": "$psk",
       "udp_over_tcp": { "enabled": true, "version": 2 }, "detour": "naive" }
   ],
-  "route": { "rules": [ { "network": "udp", "outbound": "ss-uot" } ], "final": "naive" }
+  "route": { "rules": [ { "network": "udp", "action": "route", "outbound": "ss-uot" } ], "final": "naive" }
 }
 EOF
 	chmod 0600 "$f"
