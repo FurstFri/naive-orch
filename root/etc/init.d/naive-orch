@@ -1,0 +1,194 @@
+#!/bin/sh /etc/rc.common
+
+# naive-orch: orchestrates one or more naiveproxy -> local SOCKS5 ports.
+# Routing / DNS / selector / urltest is Podkop's job, not ours.
+
+USE_PROCD=1
+START=88
+STOP=10
+
+EXTRA_COMMANDS="check update"
+EXTRA_HELP="    check     Show healthcheck status (status.json)
+    update    Update subscriptions now (optional: <name>)"
+
+. /usr/libexec/naive-orch/lib.sh
+
+g_enabled=1
+g_bind="127.0.0.1"
+g_interval=30
+# variant B (UDP-over-TCP) globals
+g_uot=0
+g_uot_psk=""
+g_uot_port=8388
+g_uot_method="2022-blake3-aes-128-gcm"
+g_uot_offset=1000
+
+USED_PORTS=" "
+
+# the global section is anonymous (type 'global'); read it via config_foreach so
+# values are actually picked up (a by-name config_get would only ever hit defaults).
+load_global_section() {
+	local s="$1"
+	config_get_bool g_enabled  "$s" enabled        1
+	config_get      g_bind     "$s" bind_host      "127.0.0.1"
+	config_get      g_interval "$s" check_interval 30
+	config_get_bool g_uot      "$s" udp_over_tcp   0
+	config_get      g_uot_psk  "$s" uot_psk        ""
+	config_get      g_uot_port "$s" uot_port       8388
+	config_get      g_uot_method "$s" uot_method   "2022-blake3-aes-128-gcm"
+	config_get      g_uot_offset "$s" uot_offset   1000
+}
+
+load_global() {
+	config_foreach load_global_section global
+}
+
+start_node() {
+	local id="$1"
+	local enabled port proxy label conc padding
+
+	config_get_bool enabled "$id" enabled 1
+	[ "$enabled" = "1" ] || return 0
+
+	config_get port    "$id" listen_port
+	config_get proxy   "$id" proxy
+	config_get label   "$id" label "naive-$id"
+	config_get conc    "$id" concurrency 0
+	config_get padding "$id" padding 0
+
+	if [ -z "$port" ] || [ -z "$proxy" ]; then
+		no_log "node $id: missing listen_port or proxy, skipping"
+		return 0
+	fi
+	if ! no_is_pos_int "$port"; then
+		no_log "node $id: invalid listen_port '$port', skipping"
+		return 0
+	fi
+	if ! no_validate_proxy "$proxy"; then
+		no_log "node $id: proxy must start with https://, skipping"
+		return 0
+	fi
+	case "$USED_PORTS" in
+		*" $port "*)
+			no_log "node $id: port $port already in use by another node, skipping"
+			return 0 ;;
+	esac
+	USED_PORTS="$USED_PORTS$port "
+
+	# variant B: a sing-box wrapper owns the public port and splits TCP/UDP;
+	# naive itself moves to an internal port (public + offset).
+	if [ "$g_uot" = "1" ] && [ -n "$g_uot_psk" ] && [ -x "$NO_SB_BIN" ]; then
+		local inner=$((port + g_uot_offset))
+		local de_host="$(no_proxy_host "$proxy")"
+		no_render_node    "$id" "127.0.0.1" "$inner" "$proxy" "$conc" "$padding"
+		no_render_wrapper "$id" "$g_bind" "$port" "$inner" "$de_host" \
+		                  "$g_uot_port" "$g_uot_method" "$g_uot_psk"
+
+		procd_open_instance "$id"
+		procd_set_param command "$NO_BIN" "$NO_RUNDIR/$id.json"
+		procd_set_param respawn 3600 5 5
+		procd_set_param limits nofile="65535 65535"
+		procd_set_param stdout 1
+		procd_set_param stderr 1
+		procd_set_param pidfile "/var/run/naive-orch-$id.pid"
+		procd_close_instance
+
+		procd_open_instance "$id-uot"
+		procd_set_param command "$NO_SB_BIN" run -c "$NO_RUNDIR/$id.wrap.json"
+		procd_set_param respawn 3600 5 5
+		procd_set_param stdout 1
+		procd_set_param stderr 1
+		procd_set_param pidfile "/var/run/naive-orch-$id-uot.pid"
+		procd_close_instance
+
+		no_log "node $id ($label): UoT socks://$g_bind:$port (wrapper) -> naive 127.0.0.1:$inner -> $de_host:$g_uot_port"
+		return 0
+	fi
+
+	# legacy / UoT-off: naive listens directly on the public port (TCP only).
+	no_render_node "$id" "$g_bind" "$port" "$proxy" "$conc" "$padding"
+
+	procd_open_instance "$id"
+	procd_set_param command "$NO_BIN" "$NO_RUNDIR/$id.json"
+	procd_set_param respawn 3600 5 5
+	# naive busy-loops on accept() once it runs out of file descriptors
+	# (Accept error: ERR_INSUFFICIENT_RESOURCES). procd default nofile is 1024,
+	# far too low for a node carrying primary traffic — raise it.
+	procd_set_param limits nofile="65535 65535"
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param pidfile "/var/run/naive-orch-$id.pid"
+	procd_close_instance
+
+	no_log "node $id ($label): socks://$g_bind:$port -> up"
+}
+
+start_service() {
+	config_load "$NO_CFG"
+	load_global
+	no_is_pos_int "$g_interval" || g_interval=30
+
+	if [ "$g_enabled" != "1" ]; then
+		no_log "globally disabled (global.enabled=0), nothing started"
+		return 0
+	fi
+	if [ ! -x "$NO_BIN" ]; then
+		no_log "naive binary not found/executable at $NO_BIN, aborting start"
+		return 0
+	fi
+
+	mkdir -p "$NO_RUNDIR";    chmod 0700 "$NO_RUNDIR"
+	mkdir -p "$NO_STATUSDIR"; chmod 0700 "$NO_STATUSDIR"
+	rm -f "$NO_RUNDIR"/*.json 2>/dev/null
+
+	config_foreach start_node node
+
+	# refresh the direct-list of upstream servers (loop protection helper)
+	[ -x /usr/libexec/naive-orch/sub-update ] && \
+		/usr/libexec/naive-orch/sub-update --servers-only >/dev/null 2>&1
+
+	# healthcheck as its own instance (procd does not schedule by interval)
+	if [ -x /usr/libexec/naive-orch/healthcheck ]; then
+		procd_open_instance "healthcheck"
+		procd_set_param command /bin/sh -c \
+			"while :; do /usr/libexec/naive-orch/healthcheck; sleep ${g_interval:-30}; done"
+		procd_set_param respawn 3600 10 0
+		procd_close_instance
+	fi
+
+	# subscription auto-update timer (decides per-subscription when to refresh)
+	if [ -x /usr/libexec/naive-orch/sub-update ]; then
+		procd_open_instance "subtimer"
+		procd_set_param command /bin/sh -c \
+			"while :; do sleep 3600; /usr/libexec/naive-orch/sub-update --timer; done"
+		procd_set_param respawn 3600 10 0
+		procd_close_instance
+	fi
+}
+
+stop_service() {
+	# Do not leave a successful-looking CLI status behind after the service was
+	# explicitly stopped. LuCI also checks procd state, this keeps both views in sync.
+	rm -f "$NO_STATUS" 2>/dev/null
+	rmdir "$NO_HEALTHLOCK" 2>/dev/null
+	return 0
+}
+
+service_triggers() {
+	procd_add_reload_trigger "$NO_CFG"
+}
+
+# JSON config is regenerated on start; force a full restart on reload so
+# instances pick up new configs (procd would otherwise keep them running).
+reload_service() {
+	stop
+	start
+}
+
+check() {
+	/usr/libexec/naive-orch/status
+}
+
+update() {
+	/usr/libexec/naive-orch/sub-update "$1"
+}

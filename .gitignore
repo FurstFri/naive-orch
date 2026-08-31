@@ -1,0 +1,13 @@
+.claude/
+install-smartdns.sh
+naive-orch-podkop-plan.md
+NAIVE-UOT-NOTES.md
+ROUTER-GUIDE.md
+router-naive-orch-uot.md
+udp-over-tcp-action-plan.md
+udp-over-tcp-plan.md
+server/de-node-uot-setup.md
+*.new
+*.tmp
+.DS_Store
+Thumbs.db

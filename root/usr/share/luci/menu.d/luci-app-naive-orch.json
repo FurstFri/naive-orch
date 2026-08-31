@@ -1,0 +1,29 @@
+{
+	"admin/services/naive-orch": {
+		"title": "Naive Orchestrator",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "naive-orch/overview"
+		},
+		"depends": {
+			"acl": [ "luci-app-naive-orch" ]
+		}
+	},
+	"admin/services/naive-orch/overview": {
+		"title": "Status",
+		"order": 1,
+		"action": {
+			"type": "view",
+			"path": "naive-orch/overview"
+		}
+	},
+	"admin/services/naive-orch/settings": {
+		"title": "Settings",
+		"order": 2,
+		"action": {
+			"type": "view",
+			"path": "naive-orch/settings"
+		}
+	}
+}

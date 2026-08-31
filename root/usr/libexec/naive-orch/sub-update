@@ -1,0 +1,455 @@
+#!/bin/sh
+# sub-update: fetch naive subscriptions, parse, materialize nodes into UCI.
+#
+# Usage:
+#   sub-update                update all enabled subscriptions (force)
+#   sub-update <name>         update one subscription (force)
+#   sub-update --all          update all enabled subscriptions (force)
+#   sub-update --timer        update only subscriptions that are due (auto timer)
+#   sub-update --servers-only just rebuild servers.txt from current UCI nodes
+#   sub-update --start [name]  start a non-blocking update for LuCI
+#   sub-update --status        print the current/last operation as JSON
+
+. /lib/functions.sh
+. /usr/libexec/naive-orch/lib.sh
+
+MODE="$1"
+MODE_ARG="$2"
+TAKEN=""
+SUB_NODES=0
+SUB_ERROR=""
+
+# ---- observable operation state ------------------------------------------
+
+subop_write() {
+	local state="$1" current="$2" completed="$3" total="$4" nodes="$5"
+	local message="$6" finished="${7:-0}" tmp
+	tmp="$NO_SUBOP.$$"
+	{
+		printf '{\n'
+		printf '  "state": "%s",\n' "$(no_json_escape "$state")"
+		printf '  "mode": "%s",\n' "$(no_json_escape "${OP_MODE:-all}")"
+		printf '  "current": "%s",\n' "$(no_json_escape "$current")"
+		printf '  "completed": %s,\n' "${completed:-0}"
+		printf '  "total": %s,\n' "${total:-0}"
+		printf '  "nodes": %s,\n' "${nodes:-0}"
+		printf '  "message": "%s",\n' "$(no_json_escape "$message")"
+		printf '  "started_at": %s,\n' "${OP_STARTED:-0}"
+		printf '  "finished_at": %s\n' "$finished"
+		printf '}\n'
+	} > "$tmp"
+	mv "$tmp" "$NO_SUBOP"
+	chmod 0600 "$NO_SUBOP" 2>/dev/null
+}
+
+subop_idle() {
+	printf '%s\n' '{"state":"idle","mode":"","current":"","completed":0,"total":0,"nodes":0,"message":"Обновления ещё не запускались","started_at":0,"finished_at":0}'
+}
+
+mkdir -p "$NO_STATUSDIR"
+chmod 0700 "$NO_STATUSDIR" 2>/dev/null
+
+if [ "$MODE" = "--status" ]; then
+	[ -s "$NO_SUBOP" ] && cat "$NO_SUBOP" || subop_idle
+	exit 0
+fi
+
+acquire_lock() {
+	local oldpid
+	mkdir "$NO_SUBLOCK" 2>/dev/null && return 0
+	oldpid="$(cat "$NO_SUBLOCK/pid" 2>/dev/null)"
+	case "$oldpid" in
+		''|*[!0-9]*) return 1 ;;
+	esac
+	if kill -0 "$oldpid" 2>/dev/null; then
+		return 1
+	fi
+	# A process killed with SIGKILL cannot run its trap. Recover that stale lock.
+	rm -f "$NO_SUBLOCK/pid" 2>/dev/null
+	rmdir "$NO_SUBLOCK" 2>/dev/null || return 1
+	mkdir "$NO_SUBLOCK" 2>/dev/null
+}
+
+# LuCI starts the potentially slow network operation in the background, then
+# polls --status. mkdir is an atomic lock and prevents manual/automatic runs
+# from changing UCI at the same time.
+if [ "$MODE" = "--start" ]; then
+	target="${MODE_ARG:---all}"
+	case "$target" in
+		--all) ;;
+		''|*[!A-Za-z0-9_]*) echo "invalid subscription name" >&2; exit 2 ;;
+		*) ;;
+	esac
+	if ! acquire_lock; then
+		echo "subscription update is already running" >&2
+		exit 3
+	fi
+	echo "$$" > "$NO_SUBLOCK/pid"
+	OP_STARTED="$(date +%s)"
+	OP_MODE="$target"
+	subop_write "running" "" 0 0 0 "Запуск обновления подписок"
+	NO_SUBUPDATE_LOCKED=1 NO_SUBUPDATE_STARTED="$OP_STARTED" \
+		"$0" --run "$target" >/tmp/naive-orch-sub-update.log 2>&1 &
+	[ -d "$NO_SUBLOCK" ] && echo "$!" > "$NO_SUBLOCK/pid" 2>/dev/null
+	printf '{"accepted":true,"pid":%s}\n' "$!"
+	exit 0
+fi
+
+if [ "$MODE" = "--run" ]; then
+	MODE="${MODE_ARG:---all}"
+fi
+
+LOCK_CLEANUP=0
+if [ "$NO_SUBUPDATE_LOCKED" = "1" ]; then
+	LOCK_CLEANUP=1
+else
+	if ! acquire_lock; then
+		echo "subscription update is already running" >&2
+		exit 3
+	fi
+	echo "$$" > "$NO_SUBLOCK/pid"
+	LOCK_CLEANUP=1
+fi
+
+cleanup_lock() {
+	[ "$LOCK_CLEANUP" = "1" ] && rm -f "$NO_SUBLOCK/pid" 2>/dev/null
+	[ "$LOCK_CLEANUP" = "1" ] && rmdir "$NO_SUBLOCK" 2>/dev/null
+}
+trap cleanup_lock 0
+trap 'exit 1' 1 2 15
+
+OP_STARTED="${NO_SUBUPDATE_STARTED:-$(date +%s)}"
+OP_MODE="${MODE:-all}"
+
+# ---- helpers --------------------------------------------------------------
+
+no_sid() {
+	echo "$1" | sed 's/[^A-Za-z0-9_]/_/g'
+}
+
+no_hostport() {
+	local u="${1#https://}"
+	u="${u%%\?*}"; u="${u%%#*}"; u="${u##*@}"
+	echo "$u"
+}
+
+# host:port from an https:// url (default port 443)
+no_url_hostport() {
+	local u="${1#https://}"; u="${u%%/*}"
+	case "$u" in *:*) echo "$u" ;; *) echo "$u:443" ;; esac
+}
+
+# fetch_url <url> [resolve_ip]
+# resolve_ip pins the URL host to a specific IP (curl --resolve), useful when the
+# subscription domain points at this router's own public IP but the panel lives
+# on an internal host (DNAT). TLS is still fully verified against the domain.
+fetch_url() {
+	local url="$1" rip="$2" resolve=""
+	[ -n "$rip" ] && resolve="--resolve $(no_url_hostport "$url"):$rip"
+	if command -v curl >/dev/null 2>&1; then
+		curl -sS -L --max-time 25 $resolve "$url" 2>/dev/null
+	elif command -v uclient-fetch >/dev/null 2>&1; then
+		uclient-fetch -qO - "$url" 2>/dev/null
+	else
+		wget -qO - "$url" 2>/dev/null
+	fi
+}
+
+# stdin -> decoded list of "naive+https://..." lines (handles base64 / plaintext)
+decode_body() {
+	local data b pad
+	data="$(cat)"
+	case "$data" in
+		*naive+https://*) printf '%s\n' "$data" | tr -d '\r'; return 0 ;;
+	esac
+	b="$(printf '%s' "$data" | tr -d '\r\n\t ' | tr '_-' '/+')"
+	pad=$(( ${#b} % 4 ))
+	[ "$pad" = "2" ] && b="${b}=="
+	[ "$pad" = "3" ] && b="${b}="
+	printf '%s' "$b" | base64 -d 2>/dev/null \
+		|| printf '%s' "$b" | openssl base64 -d -A 2>/dev/null
+}
+
+# parse one "naive+https://user:pass@host:port?query#label" line
+# sets globals: PROXY LABEL PADDING HOSTPORT
+parse_line() {
+	local u frag query hostport
+	u="${1#naive+}"
+	frag=""; case "$u" in *#*) frag="${u##*#}"; u="${u%%#*}" ;; esac
+	query=""; case "$u" in *\?*) query="${u#*\?}"; u="${u%%\?*}" ;; esac
+	PROXY="$u"
+	LABEL="$frag"
+	PADDING=0; case "$query" in *padding=true*) PADDING=1 ;; esac
+	hostport="${u#https://}"; HOSTPORT="${hostport##*@}"
+}
+
+# ---- port map (stable label -> port across updates) -----------------------
+
+port_is_taken() {
+	local p="$1"
+	case " $TAKEN " in *" $p "*) return 0 ;; esac
+	awk -v port="$p" '$2==port{f=1} END{exit !f}' "$NO_PORTMAP" 2>/dev/null && return 0
+	return 1
+}
+
+portmap_get() {
+	local key="$1" base="$2" p
+	touch "$NO_PORTMAP"
+	p="$(awk -v k="$key" '$1==k{print $2; exit}' "$NO_PORTMAP" 2>/dev/null)"
+	if [ -n "$p" ]; then echo "$p"; return 0; fi
+	p="$base"
+	while port_is_taken "$p"; do p=$(( p + 1 )); done
+	printf '%s %s\n' "$key" "$p" >> "$NO_PORTMAP"
+	echo "$p"
+}
+
+collect_manual_port() {
+	local id="$1" src port
+	config_get src "$id" source ""
+	[ -n "$src" ] && return 0
+	config_get port "$id" listen_port
+	[ -n "$port" ] && TAKEN="$TAKEN $port"
+}
+
+# ---- servers.txt (loop-protection helper) ---------------------------------
+
+collect_server() {
+	local id="$1" enabled proxy
+	config_get_bool enabled "$id" enabled 1
+	[ "$enabled" = "1" ] || return 0
+	config_get proxy "$id" proxy
+	[ -n "$proxy" ] && no_hostport "$proxy" >> "$NO_SERVERS.tmp"
+}
+
+rebuild_servers() {
+	config_load "$NO_CFG"
+	mkdir -p "$NO_STATUSDIR"; chmod 0700 "$NO_STATUSDIR" 2>/dev/null
+	: > "$NO_SERVERS.tmp"
+	config_foreach collect_server node
+	sort -u "$NO_SERVERS.tmp" > "$NO_SERVERS" 2>/dev/null
+	rm -f "$NO_SERVERS.tmp"
+	chmod 0600 "$NO_SERVERS" 2>/dev/null
+}
+
+# ---- subscription timer state --------------------------------------------
+
+sub_due() {
+	local name="$1" auto interval last now
+	config_get_bool auto "$name" auto_update 1
+	[ "$auto" = "1" ] || return 1
+	config_get interval "$name" update_interval 12
+	no_is_pos_int "$interval" || return 1
+	last="$(awk -v k="$name" '$1==k{print $2; exit}' "$NO_SUBSTATE" 2>/dev/null)"
+	[ -n "$last" ] || return 0
+	now="$(date +%s)"
+	[ "$(( now - last ))" -ge "$(( interval * 3600 ))" ] && return 0
+	return 1
+}
+
+state_set() {
+	local name="$1" now
+	now="$(date +%s)"
+	touch "$NO_SUBSTATE"
+	grep -v "^$name " "$NO_SUBSTATE" > "$NO_SUBSTATE.tmp" 2>/dev/null
+	printf '%s %s\n' "$name" "$now" >> "$NO_SUBSTATE.tmp"
+	mv "$NO_SUBSTATE.tmp" "$NO_SUBSTATE"
+}
+
+# ---- delete previously imported nodes of a subscription -------------------
+
+del_sub_nodes() {
+	local name="$1" s
+	for s in $(uci -q show "$NO_CFG" | sed -n "s/^$NO_CFG\.\([^.]*\)\.source='sub:$name'\$/\1/p"); do
+		uci -q delete "$NO_CFG.$s"
+	done
+}
+
+# ---- update one subscription ----------------------------------------------
+
+do_sub() {
+	local name="$1" enabled url base conc prefix resolve raw body n
+	SUB_NODES=0
+	SUB_ERROR=""
+	config_get_bool enabled "$name" enabled 1
+	[ "$enabled" = "1" ] || {
+		SUB_ERROR="подписка выключена"
+		no_log "sub $name: disabled, skip"
+		return 1
+	}
+	config_get url     "$name" url
+	config_get base    "$name" base_port 1100
+	config_get conc    "$name" concurrency 0
+	config_get prefix  "$name" label_prefix "$name"
+	config_get resolve "$name" resolve ""
+	[ -n "$url" ] || {
+		SUB_ERROR="не задан URL подписки"
+		no_log "sub $name: no url, skip"
+		return 1
+	}
+	if ! no_is_pos_int "$base" || [ "$base" -gt 65535 ]; then
+		SUB_ERROR="некорректный базовый порт"
+		no_log "sub $name: invalid base port '$base'"
+		return 1
+	fi
+
+	if ! raw="$(fetch_url "$url" "$resolve")"; then
+		SUB_ERROR="не удалось загрузить подписку"
+		no_log "sub $name: download failed"
+		return 1
+	fi
+	if ! body="$(printf '%s' "$raw" | decode_body)"; then
+		SUB_ERROR="ответ не является списком naive или корректным base64"
+		no_log "sub $name: decode failed"
+		return 1
+	fi
+	n="$(printf '%s\n' "$body" | grep -c '^naive+https://')"
+	if [ "${n:-0}" -lt 1 ]; then
+		SUB_ERROR="в подписке не найдены naive-узлы"
+		no_log "sub $name: fetched but no naive+ nodes parsed"
+		return 1
+	fi
+
+	TAKEN=""
+	config_foreach collect_manual_port node
+
+	del_sub_nodes "$name"
+
+	printf '%s\n' "$body" | while IFS= read -r line; do
+		case "$line" in naive+https://*) ;; *) continue ;; esac
+		parse_line "$line"
+		[ -n "$LABEL" ] || LABEL="node"
+		local port sid
+		port="$(portmap_get "$name/$(no_sid "$LABEL")" "$base")"
+		sid="$(no_sid "sub_${name}_${LABEL}")"
+		uci -q delete "$NO_CFG.$sid"
+		uci set "$NO_CFG.$sid=node"
+		uci set "$NO_CFG.$sid.source=sub:$name"
+		uci set "$NO_CFG.$sid.managed=1"
+		uci set "$NO_CFG.$sid.enabled=1"
+		uci set "$NO_CFG.$sid.label=${prefix}-${LABEL}"
+		uci set "$NO_CFG.$sid.listen_port=$port"
+		uci set "$NO_CFG.$sid.proxy=$PROXY"
+		[ "$PADDING" = "1" ] && uci set "$NO_CFG.$sid.padding=1"
+		no_is_pos_int "$conc" && uci set "$NO_CFG.$sid.concurrency=$conc"
+		no_log "sub $name: + ${prefix}-${LABEL} :$port ($HOSTPORT)"
+	done
+
+	no_log "sub $name: parsed $n node(s)"
+	SUB_NODES="$n"
+	return 0
+}
+
+# ---- dispatch -------------------------------------------------------------
+
+mkdir -p "$NO_PERSIST"
+chmod 0700 "$NO_PERSIST" 2>/dev/null
+
+if [ "$MODE" = "--servers-only" ]; then
+	rebuild_servers
+	exit 0
+fi
+
+config_load "$NO_CFG"
+
+CHANGED=0
+TOTAL=0
+COMPLETED=0
+UPDATED=0
+FAILED=0
+TOTAL_NODES=0
+LAST_ERROR=""
+
+sub_selected() {
+	local name="$1" enabled
+	case "$MODE" in
+		--timer) sub_due "$name" ;;
+		--all|'')
+			config_get_bool enabled "$name" enabled 1
+			[ "$enabled" = "1" ]
+			;;
+		*) [ "$name" = "$MODE" ] ;;
+	esac
+}
+
+count_sub() {
+	local name="$1"
+	sub_selected "$name" || return 0
+	TOTAL=$(( TOTAL + 1 ))
+}
+
+config_foreach count_sub subscription
+
+# "Nothing is due" is the normal hourly timer case, not a failed user action.
+# Keep the previous visible result instead of replacing it with a red error.
+if [ "$MODE" = "--timer" ] && [ "$TOTAL" -eq 0 ]; then
+	no_log "subscription timer: nothing due"
+	trap - 0 1 2 15
+	cleanup_lock
+	exit 0
+fi
+
+subop_write "running" "" 0 "$TOTAL" 0 "Подготовка обновления подписок"
+
+process_sub() {
+	local name="$1"
+	sub_selected "$name" || return 0
+	subop_write "running" "$name" "$COMPLETED" "$TOTAL" "$TOTAL_NODES" \
+		"Загрузка подписки $name"
+	if do_sub "$name"; then
+		state_set "$name"
+		CHANGED=1
+		UPDATED=$(( UPDATED + 1 ))
+		TOTAL_NODES=$(( TOTAL_NODES + SUB_NODES ))
+	else
+		FAILED=$(( FAILED + 1 ))
+		LAST_ERROR="$name: ${SUB_ERROR:-update failed}"
+	fi
+	COMPLETED=$(( COMPLETED + 1 ))
+	subop_write "running" "" "$COMPLETED" "$TOTAL" "$TOTAL_NODES" \
+		"Обработано подписок: $COMPLETED из $TOTAL"
+}
+
+config_foreach process_sub subscription
+
+if [ "$CHANGED" = "1" ]; then
+	subop_write "applying" "" "$COMPLETED" "$TOTAL" "$TOTAL_NODES" \
+		"Сохранение узлов и перезапуск сервиса"
+	if ! uci commit "$NO_CFG"; then
+		subop_write "error" "" "$COMPLETED" "$TOTAL" "$TOTAL_NODES" \
+			"Не удалось сохранить UCI-конфигурацию" "$(date +%s)"
+		exit 1
+	fi
+	if ! rebuild_servers; then
+		subop_write "error" "" "$COMPLETED" "$TOTAL" "$TOTAL_NODES" \
+			"Конфигурация сохранена, но не удалось обновить список серверов" "$(date +%s)"
+		exit 1
+	fi
+	if ! /etc/init.d/naive-orch reload >/dev/null 2>&1; then
+		subop_write "error" "" "$COMPLETED" "$TOTAL" "$TOTAL_NODES" \
+			"Узлы сохранены, но сервис не удалось перезапустить" "$(date +%s)"
+		exit 1
+	fi
+	no_log "subscriptions updated, service reloaded"
+	if [ "$FAILED" -gt 0 ]; then
+		subop_write "error" "" "$COMPLETED" "$TOTAL" "$TOTAL_NODES" \
+			"Обновлено подписок: $UPDATED; ошибка: $LAST_ERROR" "$(date +%s)"
+		exit 1
+	fi
+	subop_write "success" "" "$COMPLETED" "$TOTAL" "$TOTAL_NODES" \
+		"Обновлено подписок: $UPDATED; импортировано узлов: $TOTAL_NODES" "$(date +%s)"
+	trap - 0 1 2 15
+	cleanup_lock
+	exit 0
+elif [ "$TOTAL" -eq 0 ]; then
+	LAST_ERROR="Нет подходящих включённых подписок"
+	subop_write "error" "" 0 0 0 "$LAST_ERROR" "$(date +%s)"
+	no_log "no subscriptions selected (mode=${MODE:-all})"
+else
+	subop_write "error" "" "$COMPLETED" "$TOTAL" 0 \
+		"${LAST_ERROR:-Ни одна подписка не обновлена}" "$(date +%s)"
+	no_log "no subscriptions updated (mode=${MODE:-all})"
+fi
+
+trap - 0 1 2 15
+cleanup_lock
+exit 1

@@ -1,0 +1,46 @@
+#!/bin/sh
+# Print healthcheck status. Human-readable by default, raw JSON with --json.
+# --refresh runs a check immediately and then returns JSON (used by LuCI).
+
+. /usr/libexec/naive-orch/lib.sh
+
+if [ "$1" = "--refresh" ]; then
+	/usr/libexec/naive-orch/healthcheck >/dev/null 2>&1 || true
+	[ -f "$NO_STATUS" ] && cat "$NO_STATUS" || echo "{}"
+	exit 0
+fi
+
+if [ "$1" = "--json" ]; then
+	[ -f "$NO_STATUS" ] && cat "$NO_STATUS" || echo "{}"
+	exit 0
+fi
+
+if [ ! -f "$NO_STATUS" ]; then
+	echo "naive-orch: no status yet (service not running, or first check pending)"
+	exit 0
+fi
+
+# Pretty-print without requiring jq: parse the simple status.json we generate.
+awk '
+	/"[a-zA-Z0-9_]+": \{/ {
+		gsub(/[",:{ ]/,""); id=$0; next
+	}
+	/"label":/    { gsub(/.*"label": *"/,""); gsub(/".*/,""); label=$0; next }
+	/"status":/   { gsub(/.*"status": *"/,""); gsub(/".*/,""); st=$0; next }
+	/"port":/     { gsub(/[^0-9]/,""); port=$0; next }
+	/"latency_ms":/ { gsub(/[^0-9]/,""); lat=$0; next }
+	/"last_error":/ { gsub(/.*"last_error": *"/,""); gsub(/".*/,""); err=$0; next }
+	/^  \}/ {
+		line = sprintf("  %-12s %-9s :%-6s", label, st, port)
+		if (lat != "") line = line " " lat "ms"
+		if (err != "") line = line "  (" err ")"
+		print line
+		label=""; st=""; port=""; lat=""; err=""
+	}
+' "$NO_STATUS"
+
+if [ -f "$NO_SERVERS" ] && [ -s "$NO_SERVERS" ]; then
+	echo ""
+	echo "Upstream servers (add to Podkop direct / direct-DNS to avoid loops):"
+	sed 's/^/  /' "$NO_SERVERS"
+fi

@@ -1,0 +1,25 @@
+{
+	"luci-app-naive-orch": {
+		"description": "Grant UCI and RPC access to LuCI app naive-orch",
+		"read": {
+			"file": {
+				"/var/run/naive-orch/status.json": [ "read" ],
+				"/var/run/naive-orch/servers.txt": [ "read" ],
+				"/usr/libexec/naive-orch/status": [ "exec" ],
+				"/usr/libexec/naive-orch/sub-update": [ "exec" ],
+				"/etc/init.d/naive-orch": [ "exec" ]
+			},
+			"ubus": {
+				"service": [ "list" ]
+			},
+			"uci": [ "naive-orch" ]
+		},
+		"write": {
+			"file": {
+				"/usr/libexec/naive-orch/sub-update": [ "exec" ],
+				"/etc/init.d/naive-orch": [ "exec" ]
+			},
+			"uci": [ "naive-orch" ]
+		}
+	}
+}

@@ -1,0 +1,49 @@
+#!/bin/sh
+# render-config: (re)generate /var/etc/naive-orch/*.json for all enabled nodes,
+# without touching procd. Useful for debugging / inspecting generated configs.
+# Mirrors the init.d logic, including variant B (UDP-over-TCP) wrappers.
+
+. /lib/functions.sh
+. /usr/libexec/naive-orch/lib.sh
+
+BIND="127.0.0.1"
+G_UOT=0; G_UOT_PSK=""; G_UOT_PORT=8388; G_UOT_METHOD="2022-blake3-aes-128-gcm"; G_UOT_OFFSET=1000
+
+load_g() {
+	local s="$1"
+	config_get      BIND         "$s" bind_host    "127.0.0.1"
+	config_get_bool G_UOT        "$s" udp_over_tcp 0
+	config_get      G_UOT_PSK    "$s" uot_psk      ""
+	config_get      G_UOT_PORT   "$s" uot_port     8388
+	config_get      G_UOT_METHOD "$s" uot_method   "2022-blake3-aes-128-gcm"
+	config_get      G_UOT_OFFSET "$s" uot_offset   1000
+}
+
+config_load "$NO_CFG"
+config_foreach load_g global
+
+mkdir -p "$NO_RUNDIR"; chmod 0700 "$NO_RUNDIR"
+
+render() {
+	local id="$1" enabled port proxy conc padding
+	config_get_bool enabled "$id" enabled 1
+	[ "$enabled" = "1" ] || return 0
+	config_get port    "$id" listen_port
+	config_get proxy   "$id" proxy
+	config_get conc    "$id" concurrency 0
+	config_get padding "$id" padding 0
+	[ -n "$port" ] && [ -n "$proxy" ] || return 0
+
+	if [ "$G_UOT" = "1" ] && [ -n "$G_UOT_PSK" ]; then
+		local inner=$((port + G_UOT_OFFSET))
+		local de_host="$(no_proxy_host "$proxy")"
+		no_render_node    "$id" "127.0.0.1" "$inner" "$proxy" "$conc" "$padding"
+		no_render_wrapper "$id" "$BIND" "$port" "$inner" "$de_host" "$G_UOT_PORT" "$G_UOT_METHOD" "$G_UOT_PSK"
+		echo "rendered $NO_RUNDIR/$id.json (naive 127.0.0.1:$inner) + $id.wrap.json (socks://$BIND:$port -> $de_host:$G_UOT_PORT, UoT)"
+	else
+		no_render_node "$id" "$BIND" "$port" "$proxy" "$conc" "$padding"
+		echo "rendered $NO_RUNDIR/$id.json  (socks://$BIND:$port)"
+	fi
+}
+
+config_foreach render node

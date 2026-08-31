@@ -1,0 +1,114 @@
+#!/bin/sh
+# Healthcheck: probe each enabled node's SOCKS port, write status.json.
+# Does NOT switch routes (that is Podkop's job) and does NOT restart procd.
+
+. /lib/functions.sh
+. /usr/libexec/naive-orch/lib.sh
+
+config_load "$NO_CFG"
+HEALTH_URL="https://www.gstatic.com/generate_204"
+BIND="127.0.0.1"
+
+load_health_global() {
+	local section="$1"
+	config_get HEALTH_URL "$section" health_url "$HEALTH_URL"
+	config_get BIND       "$section" bind_host  "$BIND"
+}
+
+# Existing installations use an anonymous `config global`, while newer/manual
+# configs may name it. config_foreach handles both forms consistently.
+config_foreach load_health_global global
+
+mkdir -p "$NO_STATUSDIR"; chmod 0700 "$NO_STATUSDIR"
+mkdir "$NO_HEALTHLOCK" 2>/dev/null || exit 0
+tmp="$NO_STATUS.$$"
+now="$(date +%s)"
+fragments=""
+pids=""
+
+cleanup_healthcheck() {
+	rm -f "$tmp" "$tmp".* 2>/dev/null
+	rmdir "$NO_HEALTHLOCK" 2>/dev/null
+}
+trap cleanup_healthcheck 0
+trap 'exit 1' 1 2 15
+
+have_curl=0
+command -v curl >/dev/null 2>&1 && have_curl=1
+
+probe_node() {
+	local id="$1" port="$2" label="$3" fragment="$4"
+	local status err lat timing label_json err_json errfile
+	errfile="$fragment.err"
+	if [ "$have_curl" = "1" ]; then
+		# curl measures the complete request itself. This works on BusyBox systems
+		# where `date +%s%N` is unsupported (the old latency was therefore empty).
+		timing="$(curl -sS -o /dev/null --max-time 10 \
+			--socks5-hostname "$BIND:$port" -w '%{time_total}' \
+			"$HEALTH_URL" 2>"$errfile")"
+		if [ "$?" = "0" ]; then
+			status="healthy"
+			lat="$(LC_ALL=C awk -v seconds="$timing" 'BEGIN {
+				if (seconds ~ /^[0-9]+([.][0-9]+)?$/) printf "%.0f", seconds * 1000
+			}')"
+		else
+			status="down"
+			err="$(tail -n 1 "$errfile" 2>/dev/null)"
+			[ -n "$err" ] || err="curl failed"
+		fi
+		rm -f "$errfile"
+	else
+		status="unknown"; err="curl not installed"
+	fi
+	label_json="$(no_json_escape "$label")"
+	err_json="$(no_json_escape "$err")"
+
+	{
+		printf '"%s": {\n' "$id"
+		printf '    "label": "%s",\n' "$label_json"
+		printf '    "status": "%s",\n' "$status"
+		printf '    "port": %s,\n' "$port"
+		if [ "$status" = "healthy" ] && [ -n "$lat" ]; then
+			printf '    "latency_ms": %s,\n' "$lat"
+		fi
+		[ -n "$err_json" ] && printf '    "last_error": "%s",\n' "$err_json"
+		printf '    "last_check": %s\n' "$now"
+		printf '}\n'
+	} > "$fragment"
+}
+
+start_node_probe() {
+	local id="$1" enabled port label fragment
+	config_get_bool enabled "$id" enabled 1
+	[ "$enabled" = "1" ] || return 0
+	config_get port  "$id" listen_port
+	config_get label "$id" label "naive-$id"
+	[ -n "$port" ] || return 0
+
+	fragment="$tmp.$id"
+	fragments="$fragments $fragment"
+	probe_node "$id" "$port" "$label" "$fragment" &
+	pids="$pids $!"
+}
+
+config_foreach start_node_probe node
+
+# Probe nodes concurrently: a manual refresh now takes at most one curl timeout,
+# rather than 10 seconds multiplied by the number of nodes.
+for pid in $pids; do
+	wait "$pid"
+done
+
+printf '{\n' > "$tmp"
+first=1
+for fragment in $fragments; do
+	[ -s "$fragment" ] || continue
+	[ "$first" = "1" ] || printf ',\n' >> "$tmp"
+	first=0
+	sed 's/^/  /' "$fragment" >> "$tmp"
+done
+printf '}\n' >> "$tmp"
+mv "$tmp" "$NO_STATUS"
+chmod 0600 "$NO_STATUS"
+trap - 0 1 2 15
+cleanup_healthcheck

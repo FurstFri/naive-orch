@@ -1,0 +1,27 @@
+config global
+	option enabled '1'
+	option bind_host '127.0.0.1'
+	option health_url 'https://www.gstatic.com/generate_204'
+	option check_interval '30'
+	option restart_failed '1'
+	# --- variant B: UDP-over-TCP (UoT) ---
+	# When udp_over_tcp='1', each node's public SOCKS port is served by a small
+	# sing-box wrapper (TCP -> naive, UDP -> shadowsocks-2022 UoT through that same
+	# naive to the de-side loopback receiver). naive itself moves to public+uot_offset.
+	# Requires /usr/bin/sing-box and a UoT receiver on every de (see server/uot-server-install.sh).
+	option udp_over_tcp '0'
+	# shared PSK matching the de loopback receiver (127.0.0.1:uot_port). Must be set when UoT on.
+	option uot_psk ''
+	option uot_port '8388'
+	option uot_method '2022-blake3-aes-128-gcm'
+	option uot_offset '1000'
+
+# Пример ноды. По умолчанию ВЫКЛЮЧЕНА (enabled '0').
+# Заполни proxy реальными данными и поставь enabled '1'.
+# Логин/пароль в URL должны быть URL-encoded.
+config node 'nl'
+	option enabled '0'
+	option label 'naive-nl'
+	option listen_port '1080'
+	option proxy 'https://user:pass@nl.example.com:443'
+	option concurrency '0'
