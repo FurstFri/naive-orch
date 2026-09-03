@@ -2,17 +2,28 @@
 # Install a private sing-box UoT receiver next to a NaiveProxy server.
 # Supported server OS: Debian/Ubuntu with systemd and iptables.
 #
+# Installs TWO inbounds:
+#   * a keyless plain socks receiver (SOCKS_PORT, default 8389) — used by the
+#     naive-orch router wrapper; sing-box unwraps UoT v2 automatically;
+#   * a legacy Shadowsocks-2022 receiver (PORT, default 8388) — kept for
+#     mobile clients (NekoBox / v2rayN naive-UoT fork) that still speak SS.
+# Both ports are firewalled to the server itself and only reachable through
+# authenticated naive, so neither is exposed and no key is a secret.
+#
 # Usage on every proxy server:
-#   PSK='<shared base64 key>' sh uot-server-install.sh
+#   sh uot-server-install.sh
 #
 # Optional environment:
+#   SOCKS_PORT=8389
 #   PORT=8388
 #   METHOD=2022-blake3-aes-128-gcm
+#   PSK='<custom base64 key>'           # only if your phones use a custom key
 #   PUBIP=<server IPv4 detected by INPUT rules>
 
 set -eu
 
 PORT="${PORT:-8388}"
+SOCKS_PORT="${SOCKS_PORT:-8389}"
 METHOD="${METHOD:-2022-blake3-aes-128-gcm}"
 PSK_ENV="/etc/sing-box/uot-psk.env"
 SB_CONF="/etc/sing-box/uot-receiver.json"
@@ -28,6 +39,9 @@ trap 'exit 1' 1 2 15
 
 case "$PORT" in ''|*[!0-9]*) fail "PORT must be a number" ;; esac
 [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || fail "PORT must be between 1 and 65535"
+case "$SOCKS_PORT" in ''|*[!0-9]*) fail "SOCKS_PORT must be a number" ;; esac
+[ "$SOCKS_PORT" -ge 1 ] && [ "$SOCKS_PORT" -le 65535 ] || fail "SOCKS_PORT must be between 1 and 65535"
+[ "$SOCKS_PORT" != "$PORT" ] || fail "SOCKS_PORT must differ from PORT"
 
 case "$METHOD" in
 	2022-blake3-aes-128-gcm) KEY_SIZE=16 ;;
@@ -36,7 +50,7 @@ case "$METHOD" in
 esac
 
 missing=""
-for command_name in curl openssl ip ss iptables systemctl base64 sha256sum; do
+for command_name in curl ip ss iptables systemctl base64 sha256sum; do
 	command -v "$command_name" >/dev/null 2>&1 || missing="$missing $command_name"
 done
 if [ -n "$missing" ]; then
@@ -44,7 +58,7 @@ if [ -n "$missing" ]; then
 	log "installing required system packages"
 	apt-get update
 	DEBIAN_FRONTEND=noninteractive apt-get install -y \
-		curl ca-certificates openssl iproute2 iptables coreutils
+		curl ca-certificates iproute2 iptables coreutils
 fi
 
 install_sing_box() {
@@ -89,23 +103,32 @@ log "sing-box $($SB_BIN version | head -n 1 | awk '{print $3}')"
 
 mkdir -p /etc/sing-box /usr/local/libexec
 
-# Reuse a persisted key unless PSK was explicitly supplied.
+# Key priority: explicit PSK env > key persisted by an earlier install >
+# built-in public key (matches the naive-orch router default).
+DEFAULT_PSK16='bmFpdmUtb3JjaC11b3QtMQ=='
+DEFAULT_PSK32='bmFpdmUtb3JjaC11b3QtZGVmYXVsdC1wc2stMjAyMiE='
+PSK_SOURCE="custom"
 if [ -z "${PSK:-}" ] && [ -f "$PSK_ENV" ]; then
 	. "$PSK_ENV"
+	PSK_SOURCE="persisted"
 fi
-[ -n "${PSK:-}" ] || {
-	if [ -r /dev/tty ]; then
-		printf 'Shared UoT PSK from the OpenWrt installer: ' > /dev/tty
-		IFS= read -r PSK < /dev/tty || true
-	fi
-}
-[ -n "${PSK:-}" ] || PSK="$(openssl rand -base64 "$KEY_SIZE" | tr -d '\r\n')"
+if [ -z "${PSK:-}" ]; then
+	case "$METHOD" in
+		2022-blake3-aes-256-gcm) PSK="$DEFAULT_PSK32" ;;
+		*)                       PSK="$DEFAULT_PSK16" ;;
+	esac
+	PSK_SOURCE="built-in"
+fi
 case "$PSK" in *[!A-Za-z0-9+/=]*) fail "PSK is not valid base64" ;; esac
 decoded_size="$(printf '%s' "$PSK" | base64 -d 2>/dev/null | wc -c | tr -d ' ')"
 [ "$decoded_size" = "$KEY_SIZE" ] || \
 	fail "PSK must decode to $KEY_SIZE bytes for $METHOD"
-printf "PSK='%s'\n" "$PSK" > "$PSK_ENV"
-chmod 0600 "$PSK_ENV"
+# Persist only custom keys; the built-in key needs no state on disk.
+if [ "$PSK_SOURCE" = "custom" ]; then
+	printf "PSK='%s'\n" "$PSK" > "$PSK_ENV"
+	chmod 0600 "$PSK_ENV"
+fi
+log "UoT key: $PSK_SOURCE"
 
 PUBIP="${PUBIP:-$(ip route get 8.8.8.8 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n 1)}"
 [ -n "$PUBIP" ] || fail "could not detect server IPv4; set PUBIP explicitly"
@@ -116,31 +139,39 @@ case "$PUBIP" in *[!0-9.]*) fail "PUBIP must be an IPv4 address" ;; esac
 cat > "$FW_SCRIPT" <<EOF
 #!/bin/sh
 set -eu
-PORT='$PORT'
+PORTS='$PORT $SOCKS_PORT'
 PUBIP='$PUBIP'
-for proto in tcp udp; do
-	while iptables -C INPUT -i lo -p "\$proto" --dport "\$PORT" -j ACCEPT 2>/dev/null; do
-		iptables -D INPUT -i lo -p "\$proto" --dport "\$PORT" -j ACCEPT
+for fw_port in \$PORTS; do
+	for proto in tcp udp; do
+		while iptables -C INPUT -i lo -p "\$proto" --dport "\$fw_port" -j ACCEPT 2>/dev/null; do
+			iptables -D INPUT -i lo -p "\$proto" --dport "\$fw_port" -j ACCEPT
+		done
+		while iptables -C INPUT -p "\$proto" --dport "\$fw_port" -s "\$PUBIP" -j ACCEPT 2>/dev/null; do
+			iptables -D INPUT -p "\$proto" --dport "\$fw_port" -s "\$PUBIP" -j ACCEPT
+		done
+		while iptables -C INPUT -p "\$proto" --dport "\$fw_port" -j DROP 2>/dev/null; do
+			iptables -D INPUT -p "\$proto" --dport "\$fw_port" -j DROP
+		done
+		iptables -I INPUT 1 -p "\$proto" --dport "\$fw_port" -j DROP
+		iptables -I INPUT 1 -p "\$proto" --dport "\$fw_port" -s "\$PUBIP" -j ACCEPT
+		iptables -I INPUT 1 -i lo -p "\$proto" --dport "\$fw_port" -j ACCEPT
 	done
-	while iptables -C INPUT -p "\$proto" --dport "\$PORT" -s "\$PUBIP" -j ACCEPT 2>/dev/null; do
-		iptables -D INPUT -p "\$proto" --dport "\$PORT" -s "\$PUBIP" -j ACCEPT
-	done
-	while iptables -C INPUT -p "\$proto" --dport "\$PORT" -j DROP 2>/dev/null; do
-		iptables -D INPUT -p "\$proto" --dport "\$PORT" -j DROP
-	done
-	iptables -I INPUT 1 -p "\$proto" --dport "\$PORT" -j DROP
-	iptables -I INPUT 1 -p "\$proto" --dport "\$PORT" -s "\$PUBIP" -j ACCEPT
-	iptables -I INPUT 1 -i lo -p "\$proto" --dport "\$PORT" -j ACCEPT
 done
 EOF
 chmod 0700 "$FW_SCRIPT"
 "$FW_SCRIPT"
-log "firewall applied: port $PORT accepts only loopback and $PUBIP"
+log "firewall applied: ports $PORT and $SOCKS_PORT accept only loopback and $PUBIP"
 
 cat > "$SB_CONF" <<EOF
 {
   "log": { "level": "info", "timestamp": true },
   "inbounds": [
+    {
+      "type": "socks",
+      "tag": "socks-uot",
+      "listen": "0.0.0.0",
+      "listen_port": $SOCKS_PORT
+    },
     {
       "type": "shadowsocks",
       "tag": "ss-uot",
@@ -191,8 +222,10 @@ systemctl restart sing-box-uot
 sleep 1
 systemctl is-active --quiet sing-box-uot || fail "sing-box-uot did not start"
 ss -ltn 2>/dev/null | grep -qE "(^|[[:space:]])0\.0\.0\.0:$PORT([[:space:]]|$)" || \
-	fail "receiver is not listening on TCP port $PORT"
+	fail "SS receiver is not listening on TCP port $PORT"
+ss -ltn 2>/dev/null | grep -qE "(^|[[:space:]])0\.0\.0\.0:$SOCKS_PORT([[:space:]]|$)" || \
+	fail "socks receiver is not listening on TCP port $SOCKS_PORT"
 
-log "UoT receiver is ready on $PUBIP:$PORT and restricted to the server itself"
-log "Shared PSK — use the same value on every server and in Naive Orchestrator:"
-printf '%s\n' "$PSK"
+log "UoT receivers are ready and restricted to the server itself:"
+log "  socks (keyless, for the router): $PUBIP:$SOCKS_PORT"
+log "  shadowsocks (for mobile clients, key: $PSK_SOURCE): $PUBIP:$PORT"

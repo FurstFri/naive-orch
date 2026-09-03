@@ -68,15 +68,18 @@ no_render_node() {
 # render a sing-box "UoT wrapper" for one node (variant B).
 # The wrapper is what Podkop talks to on the public port; it splits:
 #   TCP -> the node's naive SOCKS (direct, no double tunnel)
-#   UDP -> shadowsocks-2022 with udp_over_tcp, detoured THROUGH that same naive,
-#          reaching the de-side receiver at <de_host>:<uot_port>.
-# NB: the ss-uot server is the de's PUBLIC host (not 127.0.0.1). naive's forward_proxy denies
+#   UDP -> a socks outbound with sing-box UoT v2, detoured THROUGH that same
+#          naive, reaching the de-side plain socks receiver at <de_host>:<uot_port>.
+# No key is involved: sing-box socks inbounds unwrap UoT automatically, and the
+# receiver port is firewalled so only the de itself (i.e. traffic arriving
+# through authenticated naive) can reach it. Everything is already inside TLS.
+# NB: the receiver target is the de's PUBLIC host (not 127.0.0.1). naive's forward_proxy denies
 # CONNECT to loopback by default, and the loopback-allowing ACL breaks NaiveProxy clients
 # (NekoBox). Targeting the public host hairpins into the de's own receiver (firewalled so only
 # the node itself can reach :uot_port), needs NO caddy ACL, and keeps de identical for phones.
-# args: id bind public_port naive_port de_host uot_port method psk
+# args: id bind public_port naive_port de_host uot_port
 no_render_wrapper() {
-	local id="$1" bind="$2" pub="$3" inner="$4" de_host="$5" uot_port="$6" method="$7" psk="$8"
+	local id="$1" bind="$2" pub="$3" inner="$4" de_host="$5" uot_port="$6"
 	local f="$NO_RUNDIR/$id.wrap.json"
 
 	cat > "$f" <<EOF
@@ -87,12 +90,11 @@ no_render_wrapper() {
   ],
   "outbounds": [
     { "type": "socks", "tag": "naive", "server": "127.0.0.1", "server_port": $inner },
-    { "type": "shadowsocks", "tag": "ss-uot",
+    { "type": "socks", "tag": "uot",
       "server": "$de_host", "server_port": $uot_port,
-      "method": "$method", "password": "$psk",
       "udp_over_tcp": { "enabled": true, "version": 2 }, "detour": "naive" }
   ],
-  "route": { "rules": [ { "network": "udp", "action": "route", "outbound": "ss-uot" } ], "final": "naive" }
+  "route": { "rules": [ { "network": "udp", "action": "route", "outbound": "uot" } ], "final": "naive" }
 }
 EOF
 	chmod 0600 "$f"

@@ -6,18 +6,16 @@
   "outbounds": [
     { "type": "socks", "tag": "naive", "server": "127.0.0.1", "server_port": 2100 },
     {
-      "type": "shadowsocks",
-      "tag": "ss-uot",
+      "type": "socks",
+      "tag": "uot",
       "server": "proxy.example.com",
-      "server_port": 8388,
-      "method": "2022-blake3-aes-128-gcm",
-      "password": "AAAAAAAAAAAAAAAAAAAAAA==",
+      "server_port": 8389,
       "udp_over_tcp": { "enabled": true, "version": 2 },
       "detour": "naive"
     }
   ],
   "route": {
-    "rules": [ { "network": "udp", "action": "route", "outbound": "ss-uot" } ],
+    "rules": [ { "network": "udp", "action": "route", "outbound": "uot" } ],
     "final": "naive"
   }
 }

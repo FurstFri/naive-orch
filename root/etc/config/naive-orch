@@ -4,16 +4,16 @@ config global
 	option health_url 'https://www.gstatic.com/generate_204'
 	option check_interval '30'
 	option restart_failed '1'
-	# --- variant B: UDP-over-TCP (UoT) ---
+	# --- variant B: UDP-over-TCP (UoT), keyless ---
 	# When udp_over_tcp='1', each node's public SOCKS port is served by a small
-	# sing-box wrapper (TCP -> naive, UDP -> shadowsocks-2022 UoT through that same
-	# naive to the de-side loopback receiver). naive itself moves to public+uot_offset.
+	# sing-box wrapper (TCP -> naive, UDP -> sing-box UoT v2 through that same
+	# naive to the de-side socks receiver). naive itself moves to public+uot_offset.
+	# No keys involved: the receiver is a plain socks inbound, firewalled to the
+	# server itself and only reachable through authenticated naive.
 	# Requires /usr/bin/sing-box and a UoT receiver on every de (see server/uot-server-install.sh).
 	option udp_over_tcp '0'
-	# shared PSK matching the de loopback receiver (127.0.0.1:uot_port). Must be set when UoT on.
-	option uot_psk ''
-	option uot_port '8388'
-	option uot_method '2022-blake3-aes-128-gcm'
+	# de-side socks receiver port (the legacy SS receiver for phones stays on 8388)
+	option uot_port '8389'
 	option uot_offset '1000'
 
 # Пример ноды. По умолчанию ВЫКЛЮЧЕНА (enabled '0').

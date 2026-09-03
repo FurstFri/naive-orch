@@ -7,15 +7,13 @@
 . /usr/libexec/naive-orch/lib.sh
 
 BIND="127.0.0.1"
-G_UOT=0; G_UOT_PSK=""; G_UOT_PORT=8388; G_UOT_METHOD="2022-blake3-aes-128-gcm"; G_UOT_OFFSET=1000
+G_UOT=0; G_UOT_PORT=8389; G_UOT_OFFSET=1000
 
 load_g() {
 	local s="$1"
 	config_get      BIND         "$s" bind_host    "127.0.0.1"
 	config_get_bool G_UOT        "$s" udp_over_tcp 0
-	config_get      G_UOT_PSK    "$s" uot_psk      ""
-	config_get      G_UOT_PORT   "$s" uot_port     8388
-	config_get      G_UOT_METHOD "$s" uot_method   "2022-blake3-aes-128-gcm"
+	config_get      G_UOT_PORT   "$s" uot_port     8389
 	config_get      G_UOT_OFFSET "$s" uot_offset   1000
 }
 
@@ -34,11 +32,11 @@ render() {
 	config_get padding "$id" padding 0
 	[ -n "$port" ] && [ -n "$proxy" ] || return 0
 
-	if [ "$G_UOT" = "1" ] && [ -n "$G_UOT_PSK" ]; then
+	if [ "$G_UOT" = "1" ]; then
 		local inner=$((port + G_UOT_OFFSET))
 		local de_host="$(no_proxy_host "$proxy")"
 		no_render_node    "$id" "127.0.0.1" "$inner" "$proxy" "$conc" "$padding"
-		no_render_wrapper "$id" "$BIND" "$port" "$inner" "$de_host" "$G_UOT_PORT" "$G_UOT_METHOD" "$G_UOT_PSK"
+		no_render_wrapper "$id" "$BIND" "$port" "$inner" "$de_host" "$G_UOT_PORT"
 		echo "rendered $NO_RUNDIR/$id.json (naive 127.0.0.1:$inner) + $id.wrap.json (socks://$BIND:$port -> $de_host:$G_UOT_PORT, UoT)"
 	else
 		no_render_node "$id" "$BIND" "$port" "$proxy" "$conc" "$padding"

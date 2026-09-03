@@ -28,12 +28,9 @@ extract_file 'install.sh' '0755' <<'__NAIVE_ORCH_FILE_0__'
 #   sh install.sh --enable --uot  # install sing-box and enable UDP over TCP
 #   sh install.sh --skip-naive  # do not download the official naive binary
 #
-# Optional environment:
-#   NAIVE_ORCH_UOT_PSK='<base64 16-byte key>' sh install.sh --enable --uot
-#   NAIVE_ORCH_UOT_METHOD='2022-blake3-aes-128-gcm'
-#
 # Safe by design: binds only to 127.0.0.1, the sample node is disabled,
-# nothing touches firewall / DNS / nftables.
+# nothing touches firewall / DNS / nftables. UDP over TCP is keyless: the
+# de-side receiver is a plain socks inbound reachable only through naive.
 
 set -e
 
@@ -41,7 +38,6 @@ SRC_DIR="$(cd "$(dirname "$0")" && pwd)/root"
 ENABLE=0
 INSTALL_NAIVE="${NAIVE_ORCH_INSTALL_NAIVE:-1}"
 INSTALL_UOT="${NAIVE_ORCH_INSTALL_UOT:-0}"
-UOT_PSK_EFFECTIVE=""
 PKG_UPDATED=0
 
 for arg in "$@"; do
@@ -274,56 +270,23 @@ download_sing_box() {
 	}
 }
 
-generate_uot_psk() {
-	local bytes="$1"
-	if command -v openssl >/dev/null 2>&1; then
-		openssl rand -base64 "$bytes" | tr -d '\r\n'
-	elif command -v base64 >/dev/null 2>&1 && [ -r /dev/urandom ]; then
-		dd if=/dev/urandom bs="$bytes" count=1 2>/dev/null | base64 | tr -d '\r\n'
-	else
-		echo "ERROR: cannot generate UoT PSK; install openssl-util or provide NAIVE_ORCH_UOT_PSK" >&2
-		return 1
-	fi
-}
-
-valid_uot_psk() {
-	local psk="$1" expected_size="$2" decoded_size
-	case "$psk" in *[!A-Za-z0-9+/=]*) return 1 ;; esac
-	decoded_size="$(printf '%s' "$psk" | base64 -d 2>/dev/null | wc -c | tr -d ' ')"
-	[ "$decoded_size" = "$expected_size" ]
-}
-
 configure_uot() {
-	local psk method key_size
 	[ "$INSTALL_UOT" = "1" ] || return 0
 
-	method="${NAIVE_ORCH_UOT_METHOD:-}"
-	[ -n "$method" ] || method="$(uci -q get naive-orch.@global[0].uot_method 2>/dev/null || true)"
-	[ -n "$method" ] || method='2022-blake3-aes-128-gcm'
-	case "$method" in
-		2022-blake3-aes-128-gcm) key_size=16 ;;
-		2022-blake3-aes-256-gcm) key_size=32 ;;
-		*) echo "ERROR: unsupported UoT method: $method" >&2; exit 1 ;;
-	esac
-
-	psk="${NAIVE_ORCH_UOT_PSK:-}"
-	[ -n "$psk" ] || psk="$(uci -q get naive-orch.@global[0].uot_psk 2>/dev/null || true)"
-	[ -n "$psk" ] || psk="$(generate_uot_psk "$key_size")"
-	valid_uot_psk "$psk" "$key_size" || {
-		echo "ERROR: UoT PSK must be a base64-encoded $key_size-byte key for $method" >&2
-		exit 1
-	}
-
 	uci set naive-orch.@global[0].udp_over_tcp='1'
-	uci set naive-orch.@global[0].uot_psk="$psk"
+	# Keyless UoT: the old SS-2022 options are no longer used by the router.
+	uci -q delete naive-orch.@global[0].uot_psk 2>/dev/null || true
+	uci -q delete naive-orch.@global[0].uot_method 2>/dev/null || true
+	# 8388 could only mean the legacy SS receiver; the socks receiver is 8389.
+	if [ "$(uci -q get naive-orch.@global[0].uot_port 2>/dev/null)" = "8388" ]; then
+		uci -q delete naive-orch.@global[0].uot_port
+	fi
 	uci -q get naive-orch.@global[0].uot_port >/dev/null || \
-		uci set naive-orch.@global[0].uot_port='8388'
-	uci set naive-orch.@global[0].uot_method="$method"
+		uci set naive-orch.@global[0].uot_port='8389'
 	uci -q get naive-orch.@global[0].uot_offset >/dev/null || \
 		uci set naive-orch.@global[0].uot_offset='1000'
 	uci commit naive-orch
 	chmod 0600 /etc/config/naive-orch
-	UOT_PSK_EFFECTIVE="$psk"
 }
 
 ensure_dependencies
@@ -397,11 +360,17 @@ msg "Installation complete"
 echo "Open LuCI -> Services -> Naive Orchestrator -> Settings"
 echo "Add a subscription URL, save it, then update it on the Status tab."
 if [ "$INSTALL_UOT" = "1" ]; then
+	uot_port="$(uci -q get naive-orch.@global[0].uot_port 2>/dev/null)"
+	[ -n "$uot_port" ] || uot_port='8389'
+	uot_env=""
+	[ "$uot_port" != "8389" ] && uot_env="SOCKS_PORT='$uot_port' "
 	echo ""
-	msg "UDP over TCP mode enabled"
-	echo "Shared UoT PSK: $UOT_PSK_EFFECTIVE"
-	echo "Install the UoT receiver with this same PSK on EVERY proxy server."
-	echo "Server installer: https://raw.githubusercontent.com/FurstFri/naive-orch/main/server/uot-server-install.sh"
+	msg "UDP over TCP mode enabled (keyless)"
+	echo "Run this ONE command on EVERY proxy server:"
+	echo ""
+	echo "  wget -qO- https://raw.githubusercontent.com/FurstFri/naive-orch/main/server/uot-server-install.sh | ${uot_env}sh"
+	echo ""
+	echo "The same command is shown in LuCI -> Naive Orchestrator -> Settings -> UDP over TCP."
 fi
 __NAIVE_ORCH_FILE_0__
 
@@ -412,16 +381,16 @@ config global
 	option health_url 'https://www.gstatic.com/generate_204'
 	option check_interval '30'
 	option restart_failed '1'
-	# --- variant B: UDP-over-TCP (UoT) ---
+	# --- variant B: UDP-over-TCP (UoT), keyless ---
 	# When udp_over_tcp='1', each node's public SOCKS port is served by a small
-	# sing-box wrapper (TCP -> naive, UDP -> shadowsocks-2022 UoT through that same
-	# naive to the de-side loopback receiver). naive itself moves to public+uot_offset.
+	# sing-box wrapper (TCP -> naive, UDP -> sing-box UoT v2 through that same
+	# naive to the de-side socks receiver). naive itself moves to public+uot_offset.
+	# No keys involved: the receiver is a plain socks inbound, firewalled to the
+	# server itself and only reachable through authenticated naive.
 	# Requires /usr/bin/sing-box and a UoT receiver on every de (see server/uot-server-install.sh).
 	option udp_over_tcp '0'
-	# shared PSK matching the de loopback receiver (127.0.0.1:uot_port). Must be set when UoT on.
-	option uot_psk ''
-	option uot_port '8388'
-	option uot_method '2022-blake3-aes-128-gcm'
+	# de-side socks receiver port (the legacy SS receiver for phones stays on 8388)
+	option uot_port '8389'
 	option uot_offset '1000'
 
 # Пример ноды. По умолчанию ВЫКЛЮЧЕНА (enabled '0').
@@ -454,11 +423,9 @@ EXTRA_HELP="    check     Show healthcheck status (status.json)
 g_enabled=1
 g_bind="127.0.0.1"
 g_interval=30
-# variant B (UDP-over-TCP) globals
+# variant B (UDP-over-TCP) globals; uot_port is the de-side socks receiver
 g_uot=0
-g_uot_psk=""
-g_uot_port=8388
-g_uot_method="2022-blake3-aes-128-gcm"
+g_uot_port=8389
 g_uot_offset=1000
 
 USED_PORTS=" "
@@ -471,9 +438,7 @@ load_global_section() {
 	config_get      g_bind     "$s" bind_host      "127.0.0.1"
 	config_get      g_interval "$s" check_interval 30
 	config_get_bool g_uot      "$s" udp_over_tcp   0
-	config_get      g_uot_psk  "$s" uot_psk        ""
-	config_get      g_uot_port "$s" uot_port       8388
-	config_get      g_uot_method "$s" uot_method   "2022-blake3-aes-128-gcm"
+	config_get      g_uot_port "$s" uot_port       8389
 	config_get      g_uot_offset "$s" uot_offset   1000
 }
 
@@ -514,13 +479,13 @@ start_node() {
 	USED_PORTS="$USED_PORTS$port "
 
 	# variant B: a sing-box wrapper owns the public port and splits TCP/UDP;
-	# naive itself moves to an internal port (public + offset).
-	if [ "$g_uot" = "1" ] && [ -n "$g_uot_psk" ] && [ -x "$NO_SB_BIN" ]; then
+	# naive itself moves to an internal port (public + offset). Keyless: UDP
+	# rides sing-box UoT to the de-side plain socks receiver.
+	if [ "$g_uot" = "1" ] && [ -x "$NO_SB_BIN" ]; then
 		local inner=$((port + g_uot_offset))
 		local de_host="$(no_proxy_host "$proxy")"
 		no_render_node    "$id" "127.0.0.1" "$inner" "$proxy" "$conc" "$padding"
-		no_render_wrapper "$id" "$g_bind" "$port" "$inner" "$de_host" \
-		                  "$g_uot_port" "$g_uot_method" "$g_uot_psk"
+		no_render_wrapper "$id" "$g_bind" "$port" "$inner" "$de_host" "$g_uot_port"
 
 		procd_open_instance "$id"
 		procd_set_param command "$NO_BIN" "$NO_RUNDIR/$id.json"
@@ -820,15 +785,18 @@ no_render_node() {
 # render a sing-box "UoT wrapper" for one node (variant B).
 # The wrapper is what Podkop talks to on the public port; it splits:
 #   TCP -> the node's naive SOCKS (direct, no double tunnel)
-#   UDP -> shadowsocks-2022 with udp_over_tcp, detoured THROUGH that same naive,
-#          reaching the de-side receiver at <de_host>:<uot_port>.
-# NB: the ss-uot server is the de's PUBLIC host (not 127.0.0.1). naive's forward_proxy denies
+#   UDP -> a socks outbound with sing-box UoT v2, detoured THROUGH that same
+#          naive, reaching the de-side plain socks receiver at <de_host>:<uot_port>.
+# No key is involved: sing-box socks inbounds unwrap UoT automatically, and the
+# receiver port is firewalled so only the de itself (i.e. traffic arriving
+# through authenticated naive) can reach it. Everything is already inside TLS.
+# NB: the receiver target is the de's PUBLIC host (not 127.0.0.1). naive's forward_proxy denies
 # CONNECT to loopback by default, and the loopback-allowing ACL breaks NaiveProxy clients
 # (NekoBox). Targeting the public host hairpins into the de's own receiver (firewalled so only
 # the node itself can reach :uot_port), needs NO caddy ACL, and keeps de identical for phones.
-# args: id bind public_port naive_port de_host uot_port method psk
+# args: id bind public_port naive_port de_host uot_port
 no_render_wrapper() {
-	local id="$1" bind="$2" pub="$3" inner="$4" de_host="$5" uot_port="$6" method="$7" psk="$8"
+	local id="$1" bind="$2" pub="$3" inner="$4" de_host="$5" uot_port="$6"
 	local f="$NO_RUNDIR/$id.wrap.json"
 
 	cat > "$f" <<EOF
@@ -839,12 +807,11 @@ no_render_wrapper() {
   ],
   "outbounds": [
     { "type": "socks", "tag": "naive", "server": "127.0.0.1", "server_port": $inner },
-    { "type": "shadowsocks", "tag": "ss-uot",
+    { "type": "socks", "tag": "uot",
       "server": "$de_host", "server_port": $uot_port,
-      "method": "$method", "password": "$psk",
       "udp_over_tcp": { "enabled": true, "version": 2 }, "detour": "naive" }
   ],
-  "route": { "rules": [ { "network": "udp", "action": "route", "outbound": "ss-uot" } ], "final": "naive" }
+  "route": { "rules": [ { "network": "udp", "action": "route", "outbound": "uot" } ], "final": "naive" }
 }
 EOF
 	chmod 0600 "$f"
@@ -870,15 +837,13 @@ extract_file 'root/usr/libexec/naive-orch/render-config' '0755' <<'__NAIVE_ORCH_
 . /usr/libexec/naive-orch/lib.sh
 
 BIND="127.0.0.1"
-G_UOT=0; G_UOT_PSK=""; G_UOT_PORT=8388; G_UOT_METHOD="2022-blake3-aes-128-gcm"; G_UOT_OFFSET=1000
+G_UOT=0; G_UOT_PORT=8389; G_UOT_OFFSET=1000
 
 load_g() {
 	local s="$1"
 	config_get      BIND         "$s" bind_host    "127.0.0.1"
 	config_get_bool G_UOT        "$s" udp_over_tcp 0
-	config_get      G_UOT_PSK    "$s" uot_psk      ""
-	config_get      G_UOT_PORT   "$s" uot_port     8388
-	config_get      G_UOT_METHOD "$s" uot_method   "2022-blake3-aes-128-gcm"
+	config_get      G_UOT_PORT   "$s" uot_port     8389
 	config_get      G_UOT_OFFSET "$s" uot_offset   1000
 }
 
@@ -897,11 +862,11 @@ render() {
 	config_get padding "$id" padding 0
 	[ -n "$port" ] && [ -n "$proxy" ] || return 0
 
-	if [ "$G_UOT" = "1" ] && [ -n "$G_UOT_PSK" ]; then
+	if [ "$G_UOT" = "1" ]; then
 		local inner=$((port + G_UOT_OFFSET))
 		local de_host="$(no_proxy_host "$proxy")"
 		no_render_node    "$id" "127.0.0.1" "$inner" "$proxy" "$conc" "$padding"
-		no_render_wrapper "$id" "$BIND" "$port" "$inner" "$de_host" "$G_UOT_PORT" "$G_UOT_METHOD" "$G_UOT_PSK"
+		no_render_wrapper "$id" "$BIND" "$port" "$inner" "$de_host" "$G_UOT_PORT"
 		echo "rendered $NO_RUNDIR/$id.json (naive 127.0.0.1:$inner) + $id.wrap.json (socks://$BIND:$port -> $de_host:$G_UOT_PORT, UoT)"
 	else
 		no_render_node "$id" "$BIND" "$port" "$proxy" "$conc" "$padding"
@@ -1819,9 +1784,19 @@ extract_file 'root/www/luci-static/resources/view/naive-orch/settings.js' '0644'
 'require uci';
 
 var SUB_CMD = '/usr/libexec/naive-orch/sub-update';
+var UOT_SERVER_URL = 'https://raw.githubusercontent.com/FurstFri/naive-orch/main/server/uot-server-install.sh';
 
 function maskProxy(proxy) {
 	return (proxy || '').replace(/\/\/[^@]*@/, '//***@');
+}
+
+/* The single command to paste on every proxy server. Non-default values are
+   passed explicitly; with the default port it is just "| sh". */
+function uotServerCommand(socksPort) {
+	var env = '';
+	if (socksPort && socksPort !== '8389')
+		env += "SOCKS_PORT='" + socksPort + "' ";
+	return 'wget -qO- ' + UOT_SERVER_URL + ' | ' + env + 'sh';
 }
 
 function validateHttpUrl(sectionId, value) {
@@ -1872,7 +1847,7 @@ return view.extend({
 		s.tab('advanced', _('Дополнительно'),
 			_('Меняйте эти параметры только если понимаете, зачем они нужны.'));
 		s.tab('uot', _('UDP over TCP'),
-			_('Экспериментальный режим. На каждом внешнем сервере должен быть отдельно настроен UoT-приёмник.'));
+			_('Включите режим и выполните показанную команду на каждом внешнем сервере — больше ничего настраивать не нужно.'));
 
 		o = s.taboption('basic', form.Flag, 'enabled', _('Включить сервис'),
 			_('Главный выключатель всех узлов и фоновых проверок.'));
@@ -1898,23 +1873,22 @@ return view.extend({
 		o.validate = validateHttpUrl;
 
 		o = s.taboption('uot', form.Flag, 'udp_over_tcp', _('Включить UDP over TCP'),
-			_('TCP идёт через naive, UDP — через Shadowsocks 2022 UoT внутри того же туннеля. Используйте установщик с --uot; приёмник с тем же ключом нужен на каждом сервере.'));
+			_('TCP идёт через naive, UDP — через тот же туннель до приёмника на сервере. Ключи не нужны.'));
 		o.default = '0';
 
-		o = s.taboption('uot', form.Value, 'uot_psk', _('Общий ключ UoT'),
-			_('Ключ должен совпадать с ключом приёмника на всех внешних серверах.'));
-		o.password = true;
+		o = s.taboption('uot', form.DummyValue, '_server_cmd', _('Команда для сервера'),
+			_('Выполните один раз на каждом внешнем сервере. Отражает сохранённые значения.'));
 		o.depends('udp_over_tcp', '1');
+		o.cfgvalue = function(sectionId) {
+			return E('pre', {
+				'style': 'white-space:pre-wrap;word-break:break-all;user-select:all;margin:0'
+			}, uotServerCommand(uci.get('naive-orch', sectionId, 'uot_port') || '8389'));
+		};
 
-		o = s.taboption('uot', form.Value, 'uot_port', _('Порт приёмника'));
+		o = s.taboption('uot', form.Value, 'uot_port', _('Порт приёмника'),
+			_('Socks-приёмник на сервере. Порт 8388 занят legacy-приёмником для мобильных клиентов.'));
 		o.datatype = 'port';
-		o.default = '8388';
-		o.depends('udp_over_tcp', '1');
-
-		o = s.taboption('uot', form.ListValue, 'uot_method', _('Шифрование'));
-		o.value('2022-blake3-aes-128-gcm', '2022-blake3-aes-128-gcm');
-		o.value('2022-blake3-aes-256-gcm', '2022-blake3-aes-256-gcm');
-		o.default = '2022-blake3-aes-128-gcm';
+		o.default = '8389';
 		o.depends('udp_over_tcp', '1');
 
 		o = s.taboption('uot', form.Value, 'uot_offset', _('Смещение внутреннего порта'),

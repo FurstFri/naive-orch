@@ -9,12 +9,9 @@
 #   sh install.sh --enable --uot  # install sing-box and enable UDP over TCP
 #   sh install.sh --skip-naive  # do not download the official naive binary
 #
-# Optional environment:
-#   NAIVE_ORCH_UOT_PSK='<base64 16-byte key>' sh install.sh --enable --uot
-#   NAIVE_ORCH_UOT_METHOD='2022-blake3-aes-128-gcm'
-#
 # Safe by design: binds only to 127.0.0.1, the sample node is disabled,
-# nothing touches firewall / DNS / nftables.
+# nothing touches firewall / DNS / nftables. UDP over TCP is keyless: the
+# de-side receiver is a plain socks inbound reachable only through naive.
 
 set -e
 
@@ -22,7 +19,6 @@ SRC_DIR="$(cd "$(dirname "$0")" && pwd)/root"
 ENABLE=0
 INSTALL_NAIVE="${NAIVE_ORCH_INSTALL_NAIVE:-1}"
 INSTALL_UOT="${NAIVE_ORCH_INSTALL_UOT:-0}"
-UOT_PSK_EFFECTIVE=""
 PKG_UPDATED=0
 
 for arg in "$@"; do
@@ -255,56 +251,23 @@ download_sing_box() {
 	}
 }
 
-generate_uot_psk() {
-	local bytes="$1"
-	if command -v openssl >/dev/null 2>&1; then
-		openssl rand -base64 "$bytes" | tr -d '\r\n'
-	elif command -v base64 >/dev/null 2>&1 && [ -r /dev/urandom ]; then
-		dd if=/dev/urandom bs="$bytes" count=1 2>/dev/null | base64 | tr -d '\r\n'
-	else
-		echo "ERROR: cannot generate UoT PSK; install openssl-util or provide NAIVE_ORCH_UOT_PSK" >&2
-		return 1
-	fi
-}
-
-valid_uot_psk() {
-	local psk="$1" expected_size="$2" decoded_size
-	case "$psk" in *[!A-Za-z0-9+/=]*) return 1 ;; esac
-	decoded_size="$(printf '%s' "$psk" | base64 -d 2>/dev/null | wc -c | tr -d ' ')"
-	[ "$decoded_size" = "$expected_size" ]
-}
-
 configure_uot() {
-	local psk method key_size
 	[ "$INSTALL_UOT" = "1" ] || return 0
 
-	method="${NAIVE_ORCH_UOT_METHOD:-}"
-	[ -n "$method" ] || method="$(uci -q get naive-orch.@global[0].uot_method 2>/dev/null || true)"
-	[ -n "$method" ] || method='2022-blake3-aes-128-gcm'
-	case "$method" in
-		2022-blake3-aes-128-gcm) key_size=16 ;;
-		2022-blake3-aes-256-gcm) key_size=32 ;;
-		*) echo "ERROR: unsupported UoT method: $method" >&2; exit 1 ;;
-	esac
-
-	psk="${NAIVE_ORCH_UOT_PSK:-}"
-	[ -n "$psk" ] || psk="$(uci -q get naive-orch.@global[0].uot_psk 2>/dev/null || true)"
-	[ -n "$psk" ] || psk="$(generate_uot_psk "$key_size")"
-	valid_uot_psk "$psk" "$key_size" || {
-		echo "ERROR: UoT PSK must be a base64-encoded $key_size-byte key for $method" >&2
-		exit 1
-	}
-
 	uci set naive-orch.@global[0].udp_over_tcp='1'
-	uci set naive-orch.@global[0].uot_psk="$psk"
+	# Keyless UoT: the old SS-2022 options are no longer used by the router.
+	uci -q delete naive-orch.@global[0].uot_psk 2>/dev/null || true
+	uci -q delete naive-orch.@global[0].uot_method 2>/dev/null || true
+	# 8388 could only mean the legacy SS receiver; the socks receiver is 8389.
+	if [ "$(uci -q get naive-orch.@global[0].uot_port 2>/dev/null)" = "8388" ]; then
+		uci -q delete naive-orch.@global[0].uot_port
+	fi
 	uci -q get naive-orch.@global[0].uot_port >/dev/null || \
-		uci set naive-orch.@global[0].uot_port='8388'
-	uci set naive-orch.@global[0].uot_method="$method"
+		uci set naive-orch.@global[0].uot_port='8389'
 	uci -q get naive-orch.@global[0].uot_offset >/dev/null || \
 		uci set naive-orch.@global[0].uot_offset='1000'
 	uci commit naive-orch
 	chmod 0600 /etc/config/naive-orch
-	UOT_PSK_EFFECTIVE="$psk"
 }
 
 ensure_dependencies
@@ -378,9 +341,15 @@ msg "Installation complete"
 echo "Open LuCI -> Services -> Naive Orchestrator -> Settings"
 echo "Add a subscription URL, save it, then update it on the Status tab."
 if [ "$INSTALL_UOT" = "1" ]; then
+	uot_port="$(uci -q get naive-orch.@global[0].uot_port 2>/dev/null)"
+	[ -n "$uot_port" ] || uot_port='8389'
+	uot_env=""
+	[ "$uot_port" != "8389" ] && uot_env="SOCKS_PORT='$uot_port' "
 	echo ""
-	msg "UDP over TCP mode enabled"
-	echo "Shared UoT PSK: $UOT_PSK_EFFECTIVE"
-	echo "Install the UoT receiver with this same PSK on EVERY proxy server."
-	echo "Server installer: https://raw.githubusercontent.com/FurstFri/naive-orch/main/server/uot-server-install.sh"
+	msg "UDP over TCP mode enabled (keyless)"
+	echo "Run this ONE command on EVERY proxy server:"
+	echo ""
+	echo "  wget -qO- https://raw.githubusercontent.com/FurstFri/naive-orch/main/server/uot-server-install.sh | ${uot_env}sh"
+	echo ""
+	echo "The same command is shown in LuCI -> Naive Orchestrator -> Settings -> UDP over TCP."
 fi

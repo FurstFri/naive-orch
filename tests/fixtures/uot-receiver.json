@@ -2,6 +2,12 @@
   "log": { "level": "warn" },
   "inbounds": [
     {
+      "type": "socks",
+      "tag": "socks-uot",
+      "listen": "127.0.0.1",
+      "listen_port": 8389
+    },
+    {
       "type": "shadowsocks",
       "tag": "ss-uot",
       "listen": "127.0.0.1",

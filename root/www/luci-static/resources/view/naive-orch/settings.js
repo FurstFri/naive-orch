@@ -6,9 +6,19 @@
 'require uci';
 
 var SUB_CMD = '/usr/libexec/naive-orch/sub-update';
+var UOT_SERVER_URL = 'https://raw.githubusercontent.com/FurstFri/naive-orch/main/server/uot-server-install.sh';
 
 function maskProxy(proxy) {
 	return (proxy || '').replace(/\/\/[^@]*@/, '//***@');
+}
+
+/* The single command to paste on every proxy server. Non-default values are
+   passed explicitly; with the default port it is just "| sh". */
+function uotServerCommand(socksPort) {
+	var env = '';
+	if (socksPort && socksPort !== '8389')
+		env += "SOCKS_PORT='" + socksPort + "' ";
+	return 'wget -qO- ' + UOT_SERVER_URL + ' | ' + env + 'sh';
 }
 
 function validateHttpUrl(sectionId, value) {
@@ -59,7 +69,7 @@ return view.extend({
 		s.tab('advanced', _('Дополнительно'),
 			_('Меняйте эти параметры только если понимаете, зачем они нужны.'));
 		s.tab('uot', _('UDP over TCP'),
-			_('Экспериментальный режим. На каждом внешнем сервере должен быть отдельно настроен UoT-приёмник.'));
+			_('Включите режим и выполните показанную команду на каждом внешнем сервере — больше ничего настраивать не нужно.'));
 
 		o = s.taboption('basic', form.Flag, 'enabled', _('Включить сервис'),
 			_('Главный выключатель всех узлов и фоновых проверок.'));
@@ -85,23 +95,22 @@ return view.extend({
 		o.validate = validateHttpUrl;
 
 		o = s.taboption('uot', form.Flag, 'udp_over_tcp', _('Включить UDP over TCP'),
-			_('TCP идёт через naive, UDP — через Shadowsocks 2022 UoT внутри того же туннеля. Используйте установщик с --uot; приёмник с тем же ключом нужен на каждом сервере.'));
+			_('TCP идёт через naive, UDP — через тот же туннель до приёмника на сервере. Ключи не нужны.'));
 		o.default = '0';
 
-		o = s.taboption('uot', form.Value, 'uot_psk', _('Общий ключ UoT'),
-			_('Ключ должен совпадать с ключом приёмника на всех внешних серверах.'));
-		o.password = true;
+		o = s.taboption('uot', form.DummyValue, '_server_cmd', _('Команда для сервера'),
+			_('Выполните один раз на каждом внешнем сервере. Отражает сохранённые значения.'));
 		o.depends('udp_over_tcp', '1');
+		o.cfgvalue = function(sectionId) {
+			return E('pre', {
+				'style': 'white-space:pre-wrap;word-break:break-all;user-select:all;margin:0'
+			}, uotServerCommand(uci.get('naive-orch', sectionId, 'uot_port') || '8389'));
+		};
 
-		o = s.taboption('uot', form.Value, 'uot_port', _('Порт приёмника'));
+		o = s.taboption('uot', form.Value, 'uot_port', _('Порт приёмника'),
+			_('Socks-приёмник на сервере. Порт 8388 занят legacy-приёмником для мобильных клиентов.'));
 		o.datatype = 'port';
-		o.default = '8388';
-		o.depends('udp_over_tcp', '1');
-
-		o = s.taboption('uot', form.ListValue, 'uot_method', _('Шифрование'));
-		o.value('2022-blake3-aes-128-gcm', '2022-blake3-aes-128-gcm');
-		o.value('2022-blake3-aes-256-gcm', '2022-blake3-aes-256-gcm');
-		o.default = '2022-blake3-aes-128-gcm';
+		o.default = '8389';
 		o.depends('udp_over_tcp', '1');
 
 		o = s.taboption('uot', form.Value, 'uot_offset', _('Смещение внутреннего порта'),

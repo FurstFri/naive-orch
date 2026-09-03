@@ -16,11 +16,9 @@ EXTRA_HELP="    check     Show healthcheck status (status.json)
 g_enabled=1
 g_bind="127.0.0.1"
 g_interval=30
-# variant B (UDP-over-TCP) globals
+# variant B (UDP-over-TCP) globals; uot_port is the de-side socks receiver
 g_uot=0
-g_uot_psk=""
-g_uot_port=8388
-g_uot_method="2022-blake3-aes-128-gcm"
+g_uot_port=8389
 g_uot_offset=1000
 
 USED_PORTS=" "
@@ -33,9 +31,7 @@ load_global_section() {
 	config_get      g_bind     "$s" bind_host      "127.0.0.1"
 	config_get      g_interval "$s" check_interval 30
 	config_get_bool g_uot      "$s" udp_over_tcp   0
-	config_get      g_uot_psk  "$s" uot_psk        ""
-	config_get      g_uot_port "$s" uot_port       8388
-	config_get      g_uot_method "$s" uot_method   "2022-blake3-aes-128-gcm"
+	config_get      g_uot_port "$s" uot_port       8389
 	config_get      g_uot_offset "$s" uot_offset   1000
 }
 
@@ -76,13 +72,13 @@ start_node() {
 	USED_PORTS="$USED_PORTS$port "
 
 	# variant B: a sing-box wrapper owns the public port and splits TCP/UDP;
-	# naive itself moves to an internal port (public + offset).
-	if [ "$g_uot" = "1" ] && [ -n "$g_uot_psk" ] && [ -x "$NO_SB_BIN" ]; then
+	# naive itself moves to an internal port (public + offset). Keyless: UDP
+	# rides sing-box UoT to the de-side plain socks receiver.
+	if [ "$g_uot" = "1" ] && [ -x "$NO_SB_BIN" ]; then
 		local inner=$((port + g_uot_offset))
 		local de_host="$(no_proxy_host "$proxy")"
 		no_render_node    "$id" "127.0.0.1" "$inner" "$proxy" "$conc" "$padding"
-		no_render_wrapper "$id" "$g_bind" "$port" "$inner" "$de_host" \
-		                  "$g_uot_port" "$g_uot_method" "$g_uot_psk"
+		no_render_wrapper "$id" "$g_bind" "$port" "$inner" "$de_host" "$g_uot_port"
 
 		procd_open_instance "$id"
 		procd_set_param command "$NO_BIN" "$NO_RUNDIR/$id.json"
