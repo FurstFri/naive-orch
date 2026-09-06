@@ -10,9 +10,9 @@ config global
 	# naive to the de-side socks receiver). naive itself moves to public+uot_offset.
 	# No keys involved: the receiver is a plain socks inbound, firewalled to the
 	# server itself and only reachable through authenticated naive.
-	# Requires /usr/bin/sing-box and a UoT receiver on every de (see server/uot-server-install.sh).
+	# Requires /usr/bin/sing-box and a UoT-capable receiver running on every de node.
 	option udp_over_tcp '0'
-	# de-side socks receiver port (the legacy SS receiver for phones stays on 8388)
+	# de-side socks receiver port
 	option uot_port '8389'
 	option uot_offset '1000'
 

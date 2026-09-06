@@ -346,7 +346,7 @@ command -v curl >/dev/null 2>&1 && echo "    curl: OK"
 if [ "$(uci -q get naive-orch.@global[0].udp_over_tcp)" = "1" ]; then
 	[ -x /usr/bin/sing-box ] && echo "    sing-box: OK (UoT enabled)" \
 		|| echo "    WARNING: udp_over_tcp=1 but /usr/bin/sing-box missing — UoT wrappers won't start"
-	echo "    NOTE: UoT also needs a receiver on every de node — see server/uot-server-install.sh"
+	echo "    NOTE: UoT also needs a UoT-capable receiver running on every de node"
 fi
 
 if [ "$ENABLE" = "1" ]; then
@@ -360,17 +360,11 @@ msg "Installation complete"
 echo "Open LuCI -> Services -> Naive Orchestrator -> Settings"
 echo "Add a subscription URL, save it, then update it on the Status tab."
 if [ "$INSTALL_UOT" = "1" ]; then
-	uot_port="$(uci -q get naive-orch.@global[0].uot_port 2>/dev/null)"
-	[ -n "$uot_port" ] || uot_port='8389'
-	uot_env=""
-	[ "$uot_port" != "8389" ] && uot_env="SOCKS_PORT='$uot_port' "
 	echo ""
 	msg "UDP over TCP mode enabled (keyless)"
-	echo "Run this ONE command on EVERY proxy server:"
-	echo ""
-	echo "  wget -qO- https://raw.githubusercontent.com/FurstFri/naive-orch/main/server/uot-server-install.sh | ${uot_env}sh"
-	echo ""
-	echo "The same command is shown in LuCI -> Naive Orchestrator -> Settings -> UDP over TCP."
+	echo "Every proxy server also needs a UoT-capable receiver (socks inbound on"
+	echo "sing-box) listening on the configured port — that setup is separate from"
+	echo "this project."
 fi
 __NAIVE_ORCH_FILE_0__
 
@@ -387,9 +381,9 @@ config global
 	# naive to the de-side socks receiver). naive itself moves to public+uot_offset.
 	# No keys involved: the receiver is a plain socks inbound, firewalled to the
 	# server itself and only reachable through authenticated naive.
-	# Requires /usr/bin/sing-box and a UoT receiver on every de (see server/uot-server-install.sh).
+	# Requires /usr/bin/sing-box and a UoT-capable receiver running on every de node.
 	option udp_over_tcp '0'
-	# de-side socks receiver port (the legacy SS receiver for phones stays on 8388)
+	# de-side socks receiver port
 	option uot_port '8389'
 	option uot_offset '1000'
 
@@ -1784,19 +1778,9 @@ extract_file 'root/www/luci-static/resources/view/naive-orch/settings.js' '0644'
 'require uci';
 
 var SUB_CMD = '/usr/libexec/naive-orch/sub-update';
-var UOT_SERVER_URL = 'https://raw.githubusercontent.com/FurstFri/naive-orch/main/server/uot-server-install.sh';
 
 function maskProxy(proxy) {
 	return (proxy || '').replace(/\/\/[^@]*@/, '//***@');
-}
-
-/* The single command to paste on every proxy server. Non-default values are
-   passed explicitly; with the default port it is just "| sh". */
-function uotServerCommand(socksPort) {
-	var env = '';
-	if (socksPort && socksPort !== '8389')
-		env += "SOCKS_PORT='" + socksPort + "' ";
-	return 'wget -qO- ' + UOT_SERVER_URL + ' | ' + env + 'sh';
 }
 
 function validateHttpUrl(sectionId, value) {
@@ -1875,15 +1859,6 @@ return view.extend({
 		o = s.taboption('uot', form.Flag, 'udp_over_tcp', _('Включить UDP over TCP'),
 			_('TCP идёт через naive, UDP — через тот же туннель до приёмника на сервере. Ключи не нужны.'));
 		o.default = '0';
-
-		o = s.taboption('uot', form.DummyValue, '_server_cmd', _('Команда для сервера'),
-			_('Выполните один раз на каждом внешнем сервере. Отражает сохранённые значения.'));
-		o.depends('udp_over_tcp', '1');
-		o.cfgvalue = function(sectionId) {
-			return E('pre', {
-				'style': 'white-space:pre-wrap;word-break:break-all;user-select:all;margin:0'
-			}, uotServerCommand(uci.get('naive-orch', sectionId, 'uot_port') || '8389'));
-		};
 
 		o = s.taboption('uot', form.Value, 'uot_port', _('Порт приёмника'),
 			_('Socks-приёмник на сервере. Порт 8388 занят legacy-приёмником для мобильных клиентов.'));

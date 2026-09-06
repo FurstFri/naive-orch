@@ -327,7 +327,7 @@ command -v curl >/dev/null 2>&1 && echo "    curl: OK"
 if [ "$(uci -q get naive-orch.@global[0].udp_over_tcp)" = "1" ]; then
 	[ -x /usr/bin/sing-box ] && echo "    sing-box: OK (UoT enabled)" \
 		|| echo "    WARNING: udp_over_tcp=1 but /usr/bin/sing-box missing — UoT wrappers won't start"
-	echo "    NOTE: UoT also needs a receiver on every de node — see server/uot-server-install.sh"
+	echo "    NOTE: UoT also needs a UoT-capable receiver running on every de node"
 fi
 
 if [ "$ENABLE" = "1" ]; then
@@ -341,15 +341,9 @@ msg "Installation complete"
 echo "Open LuCI -> Services -> Naive Orchestrator -> Settings"
 echo "Add a subscription URL, save it, then update it on the Status tab."
 if [ "$INSTALL_UOT" = "1" ]; then
-	uot_port="$(uci -q get naive-orch.@global[0].uot_port 2>/dev/null)"
-	[ -n "$uot_port" ] || uot_port='8389'
-	uot_env=""
-	[ "$uot_port" != "8389" ] && uot_env="SOCKS_PORT='$uot_port' "
 	echo ""
 	msg "UDP over TCP mode enabled (keyless)"
-	echo "Run this ONE command on EVERY proxy server:"
-	echo ""
-	echo "  wget -qO- https://raw.githubusercontent.com/FurstFri/naive-orch/main/server/uot-server-install.sh | ${uot_env}sh"
-	echo ""
-	echo "The same command is shown in LuCI -> Naive Orchestrator -> Settings -> UDP over TCP."
+	echo "Every proxy server also needs a UoT-capable receiver (socks inbound on"
+	echo "sing-box) listening on the configured port — that setup is separate from"
+	echo "this project."
 fi
