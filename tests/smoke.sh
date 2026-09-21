@@ -82,6 +82,36 @@ prepare_script() {
 export TEST_MOCK="$TEST_DIR/mock-openwrt.sh"
 export PATH="$TEST_DIR/bin:$PATH"
 
+# --- UoT wrapper: one sing-box config for all nodes ---------------------------
+sh -eu -c '
+. "$1"
+NO_RUNDIR="$2"; NO_WRAP="$2/uot.json"
+no_wrapper_reset
+no_wrapper_write "$NO_WRAP" && { echo "wrapper written with zero nodes"; exit 1; }
+no_wrapper_add de1 127.0.0.1 1100 2100 "$(no_proxy_host https://u:p@de1.example.com:443)" 8389 1m
+no_wrapper_add de2 127.0.0.1 1101 2101 de2.example.com 8389 30s
+no_wrapper_write "$NO_WRAP"
+for d in 30s 1m 2m30s 1h; do no_is_duration "$d" || { echo "duration $d rejected"; exit 1; }; done
+for d in "" 0 5 m 1x 1m,; do no_is_duration "$d" && { echo "duration $d accepted"; exit 1; }; done
+exit 0
+' sh "$TEST_MOCK" "$TEST_DIR/run"
+node -e '
+const fs = require("fs");
+const j = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+const inb = j.inbounds.map(i => i.tag).join(",");
+if (inb !== "in-de1,in-de2") throw new Error("wrapper inbounds: " + inb);
+if (j.inbounds[1].udp_timeout !== "30s" || j.inbounds[0].listen_port !== 1100)
+  throw new Error("wrapper inbound fields");
+const out = Object.fromEntries(j.outbounds.map(o => [o.tag, o]));
+if (out["uot-de1"].detour !== "naive-de1" || out["uot-de1"].server !== "de1.example.com")
+  throw new Error("uot outbound must detour through its own naive");
+if (out["naive-de2"].server_port !== 2101) throw new Error("naive outbound port");
+const r = j.route.rules;
+if (r.length !== 4 || r[0].network !== "udp" || r[0].outbound !== "uot-de1" ||
+    r[1].inbound[0] !== "in-de1" || r[1].outbound !== "naive-de1" || r[3].outbound !== "naive-de2")
+  throw new Error("route rules: " + JSON.stringify(r));
+' "$TEST_DIR/run/uot.json"
+
 prepare_script "$PROJECT_DIR/root/usr/libexec/naive-orch/healthcheck" "$TEST_DIR/healthcheck"
 "$TEST_DIR/healthcheck"
 

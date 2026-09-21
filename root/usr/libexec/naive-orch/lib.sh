@@ -11,6 +11,7 @@ NO_SERVERS="$NO_STATUSDIR/servers.txt"
 NO_SUBOP="$NO_STATUSDIR/sub-update.json"
 NO_SUBLOCK="$NO_STATUSDIR/sub-update.lock"
 NO_HEALTHLOCK="$NO_STATUSDIR/healthcheck.lock"
+NO_WRAP="$NO_RUNDIR/uot.json"
 
 NO_PERSIST="/etc/naive-orch"
 NO_PORTMAP="$NO_PERSIST/portmap"
@@ -65,8 +66,8 @@ no_render_node() {
 	chmod 0600 "$f"
 }
 
-# render a sing-box "UoT wrapper" for one node (variant B).
-# The wrapper is what Podkop talks to on the public port; it splits:
+# sing-box "UoT wrapper" (variant B). ONE sing-box process serves every node.
+# The wrapper is what Podkop talks to on each node's public port; it splits:
 #   TCP -> the node's naive SOCKS (direct, no double tunnel)
 #   UDP -> a socks outbound with sing-box UoT v2, detoured THROUGH that same
 #          naive, reaching the de-side plain socks receiver at <de_host>:<uot_port>.
@@ -77,27 +78,69 @@ no_render_node() {
 # CONNECT to loopback by default, and the loopback-allowing ACL breaks NaiveProxy clients
 # (NekoBox). Targeting the public host hairpins into the de's own receiver (firewalled so only
 # the node itself can reach :uot_port), needs NO caddy ACL, and keeps de identical for phones.
-# args: id bind public_port naive_port de_host uot_port
-no_render_wrapper() {
-	local id="$1" bind="$2" pub="$3" inner="$4" de_host="$5" uot_port="$6"
-	local f="$NO_RUNDIR/$id.wrap.json"
+#
+# Why one process and not one per node: every sing-box instance carries its own
+# Go runtime (~5 MB private when idle, 8-9 threads, 15-30 MB private under load)
+# on top of the shared binary text. Six listeners in one process cost one runtime.
+#
+# udp_timeout: how long an idle UDP session (and with it the UoT TCP connection
+# through naive, plus the relay buffers inside naive) is kept. Live flows refresh
+# the timer. Sessions whose SOCKS client closed the association are torn down
+# regardless of this value (measured: fds back to baseline within a minute at
+# both 30s and 5m), so it only matters for clients that keep associations open.
+#
+# Usage: no_wrapper_reset; no_wrapper_add ... once per node; no_wrapper_write <file>
+no_wrapper_reset() {
+	WRAP_IN=""; WRAP_OUT=""; WRAP_RULES=""; WRAP_FINAL=""; WRAP_N=0
+}
 
+# args: id bind public_port naive_port de_host uot_port [udp_timeout]
+no_wrapper_add() {
+	local id="$1" bind="$2" pub="$3" inner="$4" de_host="$5" uot_port="$6" udp_timeout="${7:-5m}"
+	local sep=""
+	[ "$WRAP_N" = "0" ] || sep=",
+"
+	WRAP_IN="$WRAP_IN$sep    { \"type\": \"mixed\", \"tag\": \"in-$id\", \"listen\": \"$bind\", \"listen_port\": $pub, \"udp_timeout\": \"$udp_timeout\" }"
+	WRAP_OUT="$WRAP_OUT$sep    { \"type\": \"socks\", \"tag\": \"naive-$id\", \"server\": \"127.0.0.1\", \"server_port\": $inner },
+    { \"type\": \"socks\", \"tag\": \"uot-$id\",
+      \"server\": \"$de_host\", \"server_port\": $uot_port,
+      \"udp_over_tcp\": { \"enabled\": true, \"version\": 2 }, \"detour\": \"naive-$id\" }"
+	WRAP_RULES="$WRAP_RULES$sep    { \"inbound\": [ \"in-$id\" ], \"network\": \"udp\", \"action\": \"route\", \"outbound\": \"uot-$id\" },
+    { \"inbound\": [ \"in-$id\" ], \"action\": \"route\", \"outbound\": \"naive-$id\" }"
+	[ -n "$WRAP_FINAL" ] || WRAP_FINAL="naive-$id"
+	WRAP_N=$((WRAP_N + 1))
+}
+
+# args: file   (returns 1 and writes nothing when no node was added)
+no_wrapper_write() {
+	local f="$1"
+	[ "${WRAP_N:-0}" -gt 0 ] || return 1
 	cat > "$f" <<EOF
 {
   "log": { "level": "warn" },
   "inbounds": [
-    { "type": "mixed", "tag": "in", "listen": "$bind", "listen_port": $pub }
+$WRAP_IN
   ],
   "outbounds": [
-    { "type": "socks", "tag": "naive", "server": "127.0.0.1", "server_port": $inner },
-    { "type": "socks", "tag": "uot",
-      "server": "$de_host", "server_port": $uot_port,
-      "udp_over_tcp": { "enabled": true, "version": 2 }, "detour": "naive" }
+$WRAP_OUT
   ],
-  "route": { "rules": [ { "network": "udp", "action": "route", "outbound": "uot" } ], "final": "naive" }
+  "route": {
+    "rules": [
+$WRAP_RULES
+    ],
+    "final": "$WRAP_FINAL"
+  }
 }
 EOF
 	chmod 0600 "$f"
+}
+
+# is the argument a sing-box duration like 30s, 1m, 2m30s, 1h ?
+no_is_duration() {
+	case "$1" in
+		''|*[!0-9smh]*|[!0-9]*|*[!smh]) return 1 ;;
+		*) return 0 ;;
+	esac
 }
 
 # extract the host from a naive proxy URL (https://user:pass@host:port -> host)

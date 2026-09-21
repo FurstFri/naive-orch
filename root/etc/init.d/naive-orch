@@ -20,6 +20,8 @@ g_interval=30
 g_uot=0
 g_uot_port=8389
 g_uot_offset=1000
+g_uot_udp_timeout="5m"
+g_uot_gogc=""
 
 USED_PORTS=" "
 
@@ -33,6 +35,8 @@ load_global_section() {
 	config_get_bool g_uot      "$s" udp_over_tcp   0
 	config_get      g_uot_port "$s" uot_port       8389
 	config_get      g_uot_offset "$s" uot_offset   1000
+	config_get      g_uot_udp_timeout "$s" uot_udp_timeout "5m"
+	config_get      g_uot_gogc "$s" uot_gogc ""
 }
 
 load_global() {
@@ -71,14 +75,15 @@ start_node() {
 	esac
 	USED_PORTS="$USED_PORTS$port "
 
-	# variant B: a sing-box wrapper owns the public port and splits TCP/UDP;
-	# naive itself moves to an internal port (public + offset). Keyless: UDP
-	# rides sing-box UoT to the de-side plain socks receiver.
+	# variant B: the shared sing-box wrapper owns the public port and splits
+	# TCP/UDP; naive itself moves to an internal port (public + offset). Keyless:
+	# UDP rides sing-box UoT to the de-side plain socks receiver. The wrapper
+	# process itself is started once, after all nodes (see start_wrapper).
 	if [ "$g_uot" = "1" ] && [ -x "$NO_SB_BIN" ]; then
 		local inner=$((port + g_uot_offset))
 		local de_host="$(no_proxy_host "$proxy")"
-		no_render_node    "$id" "127.0.0.1" "$inner" "$proxy" "$conc" "$padding"
-		no_render_wrapper "$id" "$g_bind" "$port" "$inner" "$de_host" "$g_uot_port"
+		no_render_node "$id" "127.0.0.1" "$inner" "$proxy" "$conc" "$padding"
+		no_wrapper_add "$id" "$g_bind" "$port" "$inner" "$de_host" "$g_uot_port" "$g_uot_udp_timeout"
 
 		procd_open_instance "$id"
 		procd_set_param command "$NO_BIN" "$NO_RUNDIR/$id.json"
@@ -87,14 +92,6 @@ start_node() {
 		procd_set_param stdout 1
 		procd_set_param stderr 1
 		procd_set_param pidfile "/var/run/naive-orch-$id.pid"
-		procd_close_instance
-
-		procd_open_instance "$id-uot"
-		procd_set_param command "$NO_SB_BIN" run -c "$NO_RUNDIR/$id.wrap.json"
-		procd_set_param respawn 3600 5 5
-		procd_set_param stdout 1
-		procd_set_param stderr 1
-		procd_set_param pidfile "/var/run/naive-orch-$id-uot.pid"
 		procd_close_instance
 
 		no_log "node $id ($label): UoT socks://$g_bind:$port (wrapper) -> naive 127.0.0.1:$inner -> $de_host:$g_uot_port"
@@ -119,6 +116,31 @@ start_node() {
 	no_log "node $id ($label): socks://$g_bind:$port -> up"
 }
 
+# one sing-box process for every UoT node (one Go runtime instead of N)
+start_wrapper() {
+	no_wrapper_write "$NO_WRAP" || return 0
+
+	procd_open_instance "uot"
+	procd_set_param command "$NO_SB_BIN" run -c "$NO_WRAP"
+	procd_set_param respawn 3600 5 5
+	# the wrapper now fronts every node's public port: give it the same fd
+	# headroom as naive (Go raises the soft limit to the hard one by itself,
+	# but procd's hard default is only 4096).
+	procd_set_param limits nofile="65535 65535"
+	# optional Go GC tuning (uci global.uot_gogc, e.g. 40): trades CPU for a
+	# smaller heap. Measured: peak private memory -15%, retained-after-burst
+	# 11 MB instead of 15-37 MB. Off by default, RAM is rarely the bottleneck.
+	if no_is_pos_int "$g_uot_gogc"; then
+		procd_set_param env GOGC="$g_uot_gogc"
+	fi
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param pidfile "/var/run/naive-orch-uot.pid"
+	procd_close_instance
+
+	no_log "UoT wrapper: 1 sing-box for $WRAP_N node(s), udp_timeout=$g_uot_udp_timeout${g_uot_gogc:+ GOGC=$g_uot_gogc}"
+}
+
 start_service() {
 	config_load "$NO_CFG"
 	load_global
@@ -136,8 +158,13 @@ start_service() {
 	mkdir -p "$NO_RUNDIR";    chmod 0700 "$NO_RUNDIR"
 	mkdir -p "$NO_STATUSDIR"; chmod 0700 "$NO_STATUSDIR"
 	rm -f "$NO_RUNDIR"/*.json 2>/dev/null
+	# pidfiles of the pre-v0.4 per-node wrappers (<id>-uot) are never rewritten
+	rm -f /var/run/naive-orch-*-uot.pid 2>/dev/null
+	no_is_duration "$g_uot_udp_timeout" || g_uot_udp_timeout="5m"
 
+	no_wrapper_reset
 	config_foreach start_node node
+	start_wrapper
 
 	# refresh the direct-list of upstream servers (loop protection helper)
 	[ -x /usr/libexec/naive-orch/sub-update ] && \

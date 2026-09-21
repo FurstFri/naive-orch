@@ -7,7 +7,7 @@
 . /usr/libexec/naive-orch/lib.sh
 
 BIND="127.0.0.1"
-G_UOT=0; G_UOT_PORT=8389; G_UOT_OFFSET=1000
+G_UOT=0; G_UOT_PORT=8389; G_UOT_OFFSET=1000; G_UOT_UDP_TIMEOUT="5m"
 
 load_g() {
 	local s="$1"
@@ -15,12 +15,15 @@ load_g() {
 	config_get_bool G_UOT        "$s" udp_over_tcp 0
 	config_get      G_UOT_PORT   "$s" uot_port     8389
 	config_get      G_UOT_OFFSET "$s" uot_offset   1000
+	config_get      G_UOT_UDP_TIMEOUT "$s" uot_udp_timeout "5m"
 }
 
 config_load "$NO_CFG"
 config_foreach load_g global
+no_is_duration "$G_UOT_UDP_TIMEOUT" || G_UOT_UDP_TIMEOUT="5m"
 
 mkdir -p "$NO_RUNDIR"; chmod 0700 "$NO_RUNDIR"
+no_wrapper_reset
 
 render() {
 	local id="$1" enabled port proxy conc padding
@@ -35,9 +38,9 @@ render() {
 	if [ "$G_UOT" = "1" ]; then
 		local inner=$((port + G_UOT_OFFSET))
 		local de_host="$(no_proxy_host "$proxy")"
-		no_render_node    "$id" "127.0.0.1" "$inner" "$proxy" "$conc" "$padding"
-		no_render_wrapper "$id" "$BIND" "$port" "$inner" "$de_host" "$G_UOT_PORT"
-		echo "rendered $NO_RUNDIR/$id.json (naive 127.0.0.1:$inner) + $id.wrap.json (socks://$BIND:$port -> $de_host:$G_UOT_PORT, UoT)"
+		no_render_node "$id" "127.0.0.1" "$inner" "$proxy" "$conc" "$padding"
+		no_wrapper_add "$id" "$BIND" "$port" "$inner" "$de_host" "$G_UOT_PORT" "$G_UOT_UDP_TIMEOUT"
+		echo "rendered $NO_RUNDIR/$id.json (naive 127.0.0.1:$inner) + wrapper listener socks://$BIND:$port -> $de_host:$G_UOT_PORT (UoT)"
 	else
 		no_render_node "$id" "$BIND" "$port" "$proxy" "$conc" "$padding"
 		echo "rendered $NO_RUNDIR/$id.json  (socks://$BIND:$port)"
@@ -45,3 +48,6 @@ render() {
 }
 
 config_foreach render node
+if no_wrapper_write "$NO_WRAP"; then
+	echo "rendered $NO_WRAP (1 sing-box wrapper, $WRAP_N node(s), udp_timeout=$G_UOT_UDP_TIMEOUT)"
+fi

@@ -100,6 +100,15 @@ return view.extend({
 		o.default = '1000';
 		o.depends('udp_over_tcp', '1');
 
+		o = s.taboption('uot', form.Value, 'uot_udp_timeout', _('Таймаут UDP-сессии'),
+			_('Сколько держать простаивающую UDP-сессию (и её туннель через naive), если клиент не закрыл SOCKS-ассоциацию. Живые потоки таймер обновляют. Формат sing-box: 30s, 1m, 2m30s.'));
+		o.default = '5m';
+		o.rmempty = false;
+		o.validate = function(sectionId, value) {
+			return /^[0-9]+[smh]([0-9]+[smh])*$/.test(value) ? true : _('Ожидается длительность вида 30s, 1m или 1m30s');
+		};
+		o.depends('udp_over_tcp', '1');
+
 		/* ---------------- subscriptions: the primary setup path ---------------- */
 		s = m.section(form.GridSection, 'subscription', _('Подписки'),
 			_('Нажмите «Добавить», задайте понятное имя и вставьте URL. Затем нажмите «Сохранить и применить» внизу страницы и запустите обновление.'));

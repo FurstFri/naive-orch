@@ -1,21 +1,26 @@
 {
   "log": { "level": "warn" },
   "inbounds": [
-    { "type": "mixed", "tag": "in", "listen": "127.0.0.1", "listen_port": 1100 }
+    { "type": "mixed", "tag": "in-de1", "listen": "127.0.0.1", "listen_port": 1100, "udp_timeout": "1m" },
+    { "type": "mixed", "tag": "in-de2", "listen": "127.0.0.1", "listen_port": 1101, "udp_timeout": "1m" }
   ],
   "outbounds": [
-    { "type": "socks", "tag": "naive", "server": "127.0.0.1", "server_port": 2100 },
-    {
-      "type": "socks",
-      "tag": "uot",
-      "server": "proxy.example.com",
-      "server_port": 8389,
-      "udp_over_tcp": { "enabled": true, "version": 2 },
-      "detour": "naive"
-    }
+    { "type": "socks", "tag": "naive-de1", "server": "127.0.0.1", "server_port": 2100 },
+    { "type": "socks", "tag": "uot-de1",
+      "server": "de1.example.com", "server_port": 8389,
+      "udp_over_tcp": { "enabled": true, "version": 2 }, "detour": "naive-de1" },
+    { "type": "socks", "tag": "naive-de2", "server": "127.0.0.1", "server_port": 2101 },
+    { "type": "socks", "tag": "uot-de2",
+      "server": "de2.example.com", "server_port": 8389,
+      "udp_over_tcp": { "enabled": true, "version": 2 }, "detour": "naive-de2" }
   ],
   "route": {
-    "rules": [ { "network": "udp", "action": "route", "outbound": "uot" } ],
-    "final": "naive"
+    "rules": [
+      { "inbound": [ "in-de1" ], "network": "udp", "action": "route", "outbound": "uot-de1" },
+      { "inbound": [ "in-de1" ], "action": "route", "outbound": "naive-de1" },
+      { "inbound": [ "in-de2" ], "network": "udp", "action": "route", "outbound": "uot-de2" },
+      { "inbound": [ "in-de2" ], "action": "route", "outbound": "naive-de2" }
+    ],
+    "final": "naive-de1"
   }
 }

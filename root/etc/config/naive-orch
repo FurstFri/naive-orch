@@ -5,9 +5,10 @@ config global
 	option check_interval '30'
 	option restart_failed '1'
 	# --- variant B: UDP-over-TCP (UoT), keyless ---
-	# When udp_over_tcp='1', each node's public SOCKS port is served by a small
-	# sing-box wrapper (TCP -> naive, UDP -> sing-box UoT v2 through that same
-	# naive to the de-side socks receiver). naive itself moves to public+uot_offset.
+	# When udp_over_tcp='1', every node's public SOCKS port is served by ONE
+	# shared sing-box wrapper (TCP -> that node's naive, UDP -> sing-box UoT v2
+	# through the same naive to the de-side socks receiver). naive itself moves
+	# to public+uot_offset.
 	# No keys involved: the receiver is a plain socks inbound, firewalled to the
 	# server itself and only reachable through authenticated naive.
 	# Requires /usr/bin/sing-box and a UoT-capable receiver running on every de node.
@@ -15,6 +16,14 @@ config global
 	# de-side socks receiver port
 	option uot_port '8389'
 	option uot_offset '1000'
+	# How long an idle UDP session (and its UoT tunnel through naive) is kept
+	# for clients that keep the SOCKS association open. Live flows refresh the
+	# timer. sing-box default; lower it only if such sessions pile up.
+	option uot_udp_timeout '5m'
+	# Optional Go GC target for the wrapper (GOGC, e.g. 40): ~15% less peak
+	# private memory and a smaller retained heap, at the cost of extra CPU.
+	# Empty = Go default (100).
+	# option uot_gogc '40'
 
 # Пример ноды. По умолчанию ВЫКЛЮЧЕНА (enabled '0').
 # Заполни proxy реальными данными и поставь enabled '1'.

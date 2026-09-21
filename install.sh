@@ -266,6 +266,9 @@ configure_uot() {
 		uci set naive-orch.@global[0].uot_port='8389'
 	uci -q get naive-orch.@global[0].uot_offset >/dev/null || \
 		uci set naive-orch.@global[0].uot_offset='1000'
+	# idle UDP session lifetime of the shared wrapper (tuning knob, sing-box default)
+	uci -q get naive-orch.@global[0].uot_udp_timeout >/dev/null || \
+		uci set naive-orch.@global[0].uot_udp_timeout='5m'
 	uci commit naive-orch
 	chmod 0600 /etc/config/naive-orch
 }

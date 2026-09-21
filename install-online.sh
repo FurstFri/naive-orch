@@ -285,6 +285,9 @@ configure_uot() {
 		uci set naive-orch.@global[0].uot_port='8389'
 	uci -q get naive-orch.@global[0].uot_offset >/dev/null || \
 		uci set naive-orch.@global[0].uot_offset='1000'
+	# idle UDP session lifetime of the shared wrapper (tuning knob, sing-box default)
+	uci -q get naive-orch.@global[0].uot_udp_timeout >/dev/null || \
+		uci set naive-orch.@global[0].uot_udp_timeout='5m'
 	uci commit naive-orch
 	chmod 0600 /etc/config/naive-orch
 }
@@ -376,9 +379,10 @@ config global
 	option check_interval '30'
 	option restart_failed '1'
 	# --- variant B: UDP-over-TCP (UoT), keyless ---
-	# When udp_over_tcp='1', each node's public SOCKS port is served by a small
-	# sing-box wrapper (TCP -> naive, UDP -> sing-box UoT v2 through that same
-	# naive to the de-side socks receiver). naive itself moves to public+uot_offset.
+	# When udp_over_tcp='1', every node's public SOCKS port is served by ONE
+	# shared sing-box wrapper (TCP -> that node's naive, UDP -> sing-box UoT v2
+	# through the same naive to the de-side socks receiver). naive itself moves
+	# to public+uot_offset.
 	# No keys involved: the receiver is a plain socks inbound, firewalled to the
 	# server itself and only reachable through authenticated naive.
 	# Requires /usr/bin/sing-box and a UoT-capable receiver running on every de node.
@@ -386,6 +390,14 @@ config global
 	# de-side socks receiver port
 	option uot_port '8389'
 	option uot_offset '1000'
+	# How long an idle UDP session (and its UoT tunnel through naive) is kept
+	# for clients that keep the SOCKS association open. Live flows refresh the
+	# timer. sing-box default; lower it only if such sessions pile up.
+	option uot_udp_timeout '5m'
+	# Optional Go GC target for the wrapper (GOGC, e.g. 40): ~15% less peak
+	# private memory and a smaller retained heap, at the cost of extra CPU.
+	# Empty = Go default (100).
+	# option uot_gogc '40'
 
 # Пример ноды. По умолчанию ВЫКЛЮЧЕНА (enabled '0').
 # Заполни proxy реальными данными и поставь enabled '1'.
@@ -421,6 +433,8 @@ g_interval=30
 g_uot=0
 g_uot_port=8389
 g_uot_offset=1000
+g_uot_udp_timeout="5m"
+g_uot_gogc=""
 
 USED_PORTS=" "
 
@@ -434,6 +448,8 @@ load_global_section() {
 	config_get_bool g_uot      "$s" udp_over_tcp   0
 	config_get      g_uot_port "$s" uot_port       8389
 	config_get      g_uot_offset "$s" uot_offset   1000
+	config_get      g_uot_udp_timeout "$s" uot_udp_timeout "5m"
+	config_get      g_uot_gogc "$s" uot_gogc ""
 }
 
 load_global() {
@@ -472,14 +488,15 @@ start_node() {
 	esac
 	USED_PORTS="$USED_PORTS$port "
 
-	# variant B: a sing-box wrapper owns the public port and splits TCP/UDP;
-	# naive itself moves to an internal port (public + offset). Keyless: UDP
-	# rides sing-box UoT to the de-side plain socks receiver.
+	# variant B: the shared sing-box wrapper owns the public port and splits
+	# TCP/UDP; naive itself moves to an internal port (public + offset). Keyless:
+	# UDP rides sing-box UoT to the de-side plain socks receiver. The wrapper
+	# process itself is started once, after all nodes (see start_wrapper).
 	if [ "$g_uot" = "1" ] && [ -x "$NO_SB_BIN" ]; then
 		local inner=$((port + g_uot_offset))
 		local de_host="$(no_proxy_host "$proxy")"
-		no_render_node    "$id" "127.0.0.1" "$inner" "$proxy" "$conc" "$padding"
-		no_render_wrapper "$id" "$g_bind" "$port" "$inner" "$de_host" "$g_uot_port"
+		no_render_node "$id" "127.0.0.1" "$inner" "$proxy" "$conc" "$padding"
+		no_wrapper_add "$id" "$g_bind" "$port" "$inner" "$de_host" "$g_uot_port" "$g_uot_udp_timeout"
 
 		procd_open_instance "$id"
 		procd_set_param command "$NO_BIN" "$NO_RUNDIR/$id.json"
@@ -488,14 +505,6 @@ start_node() {
 		procd_set_param stdout 1
 		procd_set_param stderr 1
 		procd_set_param pidfile "/var/run/naive-orch-$id.pid"
-		procd_close_instance
-
-		procd_open_instance "$id-uot"
-		procd_set_param command "$NO_SB_BIN" run -c "$NO_RUNDIR/$id.wrap.json"
-		procd_set_param respawn 3600 5 5
-		procd_set_param stdout 1
-		procd_set_param stderr 1
-		procd_set_param pidfile "/var/run/naive-orch-$id-uot.pid"
 		procd_close_instance
 
 		no_log "node $id ($label): UoT socks://$g_bind:$port (wrapper) -> naive 127.0.0.1:$inner -> $de_host:$g_uot_port"
@@ -520,6 +529,31 @@ start_node() {
 	no_log "node $id ($label): socks://$g_bind:$port -> up"
 }
 
+# one sing-box process for every UoT node (one Go runtime instead of N)
+start_wrapper() {
+	no_wrapper_write "$NO_WRAP" || return 0
+
+	procd_open_instance "uot"
+	procd_set_param command "$NO_SB_BIN" run -c "$NO_WRAP"
+	procd_set_param respawn 3600 5 5
+	# the wrapper now fronts every node's public port: give it the same fd
+	# headroom as naive (Go raises the soft limit to the hard one by itself,
+	# but procd's hard default is only 4096).
+	procd_set_param limits nofile="65535 65535"
+	# optional Go GC tuning (uci global.uot_gogc, e.g. 40): trades CPU for a
+	# smaller heap. Measured: peak private memory -15%, retained-after-burst
+	# 11 MB instead of 15-37 MB. Off by default, RAM is rarely the bottleneck.
+	if no_is_pos_int "$g_uot_gogc"; then
+		procd_set_param env GOGC="$g_uot_gogc"
+	fi
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param pidfile "/var/run/naive-orch-uot.pid"
+	procd_close_instance
+
+	no_log "UoT wrapper: 1 sing-box for $WRAP_N node(s), udp_timeout=$g_uot_udp_timeout${g_uot_gogc:+ GOGC=$g_uot_gogc}"
+}
+
 start_service() {
 	config_load "$NO_CFG"
 	load_global
@@ -537,8 +571,13 @@ start_service() {
 	mkdir -p "$NO_RUNDIR";    chmod 0700 "$NO_RUNDIR"
 	mkdir -p "$NO_STATUSDIR"; chmod 0700 "$NO_STATUSDIR"
 	rm -f "$NO_RUNDIR"/*.json 2>/dev/null
+	# pidfiles of the pre-v0.4 per-node wrappers (<id>-uot) are never rewritten
+	rm -f /var/run/naive-orch-*-uot.pid 2>/dev/null
+	no_is_duration "$g_uot_udp_timeout" || g_uot_udp_timeout="5m"
 
+	no_wrapper_reset
 	config_foreach start_node node
+	start_wrapper
 
 	# refresh the direct-list of upstream servers (loop protection helper)
 	[ -x /usr/libexec/naive-orch/sub-update ] && \
@@ -722,6 +761,7 @@ NO_SERVERS="$NO_STATUSDIR/servers.txt"
 NO_SUBOP="$NO_STATUSDIR/sub-update.json"
 NO_SUBLOCK="$NO_STATUSDIR/sub-update.lock"
 NO_HEALTHLOCK="$NO_STATUSDIR/healthcheck.lock"
+NO_WRAP="$NO_RUNDIR/uot.json"
 
 NO_PERSIST="/etc/naive-orch"
 NO_PORTMAP="$NO_PERSIST/portmap"
@@ -776,8 +816,8 @@ no_render_node() {
 	chmod 0600 "$f"
 }
 
-# render a sing-box "UoT wrapper" for one node (variant B).
-# The wrapper is what Podkop talks to on the public port; it splits:
+# sing-box "UoT wrapper" (variant B). ONE sing-box process serves every node.
+# The wrapper is what Podkop talks to on each node's public port; it splits:
 #   TCP -> the node's naive SOCKS (direct, no double tunnel)
 #   UDP -> a socks outbound with sing-box UoT v2, detoured THROUGH that same
 #          naive, reaching the de-side plain socks receiver at <de_host>:<uot_port>.
@@ -788,27 +828,69 @@ no_render_node() {
 # CONNECT to loopback by default, and the loopback-allowing ACL breaks NaiveProxy clients
 # (NekoBox). Targeting the public host hairpins into the de's own receiver (firewalled so only
 # the node itself can reach :uot_port), needs NO caddy ACL, and keeps de identical for phones.
-# args: id bind public_port naive_port de_host uot_port
-no_render_wrapper() {
-	local id="$1" bind="$2" pub="$3" inner="$4" de_host="$5" uot_port="$6"
-	local f="$NO_RUNDIR/$id.wrap.json"
+#
+# Why one process and not one per node: every sing-box instance carries its own
+# Go runtime (~5 MB private when idle, 8-9 threads, 15-30 MB private under load)
+# on top of the shared binary text. Six listeners in one process cost one runtime.
+#
+# udp_timeout: how long an idle UDP session (and with it the UoT TCP connection
+# through naive, plus the relay buffers inside naive) is kept. Live flows refresh
+# the timer. Sessions whose SOCKS client closed the association are torn down
+# regardless of this value (measured: fds back to baseline within a minute at
+# both 30s and 5m), so it only matters for clients that keep associations open.
+#
+# Usage: no_wrapper_reset; no_wrapper_add ... once per node; no_wrapper_write <file>
+no_wrapper_reset() {
+	WRAP_IN=""; WRAP_OUT=""; WRAP_RULES=""; WRAP_FINAL=""; WRAP_N=0
+}
 
+# args: id bind public_port naive_port de_host uot_port [udp_timeout]
+no_wrapper_add() {
+	local id="$1" bind="$2" pub="$3" inner="$4" de_host="$5" uot_port="$6" udp_timeout="${7:-5m}"
+	local sep=""
+	[ "$WRAP_N" = "0" ] || sep=",
+"
+	WRAP_IN="$WRAP_IN$sep    { \"type\": \"mixed\", \"tag\": \"in-$id\", \"listen\": \"$bind\", \"listen_port\": $pub, \"udp_timeout\": \"$udp_timeout\" }"
+	WRAP_OUT="$WRAP_OUT$sep    { \"type\": \"socks\", \"tag\": \"naive-$id\", \"server\": \"127.0.0.1\", \"server_port\": $inner },
+    { \"type\": \"socks\", \"tag\": \"uot-$id\",
+      \"server\": \"$de_host\", \"server_port\": $uot_port,
+      \"udp_over_tcp\": { \"enabled\": true, \"version\": 2 }, \"detour\": \"naive-$id\" }"
+	WRAP_RULES="$WRAP_RULES$sep    { \"inbound\": [ \"in-$id\" ], \"network\": \"udp\", \"action\": \"route\", \"outbound\": \"uot-$id\" },
+    { \"inbound\": [ \"in-$id\" ], \"action\": \"route\", \"outbound\": \"naive-$id\" }"
+	[ -n "$WRAP_FINAL" ] || WRAP_FINAL="naive-$id"
+	WRAP_N=$((WRAP_N + 1))
+}
+
+# args: file   (returns 1 and writes nothing when no node was added)
+no_wrapper_write() {
+	local f="$1"
+	[ "${WRAP_N:-0}" -gt 0 ] || return 1
 	cat > "$f" <<EOF
 {
   "log": { "level": "warn" },
   "inbounds": [
-    { "type": "mixed", "tag": "in", "listen": "$bind", "listen_port": $pub }
+$WRAP_IN
   ],
   "outbounds": [
-    { "type": "socks", "tag": "naive", "server": "127.0.0.1", "server_port": $inner },
-    { "type": "socks", "tag": "uot",
-      "server": "$de_host", "server_port": $uot_port,
-      "udp_over_tcp": { "enabled": true, "version": 2 }, "detour": "naive" }
+$WRAP_OUT
   ],
-  "route": { "rules": [ { "network": "udp", "action": "route", "outbound": "uot" } ], "final": "naive" }
+  "route": {
+    "rules": [
+$WRAP_RULES
+    ],
+    "final": "$WRAP_FINAL"
+  }
 }
 EOF
 	chmod 0600 "$f"
+}
+
+# is the argument a sing-box duration like 30s, 1m, 2m30s, 1h ?
+no_is_duration() {
+	case "$1" in
+		''|*[!0-9smh]*|[!0-9]*|*[!smh]) return 1 ;;
+		*) return 0 ;;
+	esac
 }
 
 # extract the host from a naive proxy URL (https://user:pass@host:port -> host)
@@ -831,7 +913,7 @@ extract_file 'root/usr/libexec/naive-orch/render-config' '0755' <<'__NAIVE_ORCH_
 . /usr/libexec/naive-orch/lib.sh
 
 BIND="127.0.0.1"
-G_UOT=0; G_UOT_PORT=8389; G_UOT_OFFSET=1000
+G_UOT=0; G_UOT_PORT=8389; G_UOT_OFFSET=1000; G_UOT_UDP_TIMEOUT="5m"
 
 load_g() {
 	local s="$1"
@@ -839,12 +921,15 @@ load_g() {
 	config_get_bool G_UOT        "$s" udp_over_tcp 0
 	config_get      G_UOT_PORT   "$s" uot_port     8389
 	config_get      G_UOT_OFFSET "$s" uot_offset   1000
+	config_get      G_UOT_UDP_TIMEOUT "$s" uot_udp_timeout "5m"
 }
 
 config_load "$NO_CFG"
 config_foreach load_g global
+no_is_duration "$G_UOT_UDP_TIMEOUT" || G_UOT_UDP_TIMEOUT="5m"
 
 mkdir -p "$NO_RUNDIR"; chmod 0700 "$NO_RUNDIR"
+no_wrapper_reset
 
 render() {
 	local id="$1" enabled port proxy conc padding
@@ -859,9 +944,9 @@ render() {
 	if [ "$G_UOT" = "1" ]; then
 		local inner=$((port + G_UOT_OFFSET))
 		local de_host="$(no_proxy_host "$proxy")"
-		no_render_node    "$id" "127.0.0.1" "$inner" "$proxy" "$conc" "$padding"
-		no_render_wrapper "$id" "$BIND" "$port" "$inner" "$de_host" "$G_UOT_PORT"
-		echo "rendered $NO_RUNDIR/$id.json (naive 127.0.0.1:$inner) + $id.wrap.json (socks://$BIND:$port -> $de_host:$G_UOT_PORT, UoT)"
+		no_render_node "$id" "127.0.0.1" "$inner" "$proxy" "$conc" "$padding"
+		no_wrapper_add "$id" "$BIND" "$port" "$inner" "$de_host" "$G_UOT_PORT" "$G_UOT_UDP_TIMEOUT"
+		echo "rendered $NO_RUNDIR/$id.json (naive 127.0.0.1:$inner) + wrapper listener socks://$BIND:$port -> $de_host:$G_UOT_PORT (UoT)"
 	else
 		no_render_node "$id" "$BIND" "$port" "$proxy" "$conc" "$padding"
 		echo "rendered $NO_RUNDIR/$id.json  (socks://$BIND:$port)"
@@ -869,6 +954,9 @@ render() {
 }
 
 config_foreach render node
+if no_wrapper_write "$NO_WRAP"; then
+	echo "rendered $NO_WRAP (1 sing-box wrapper, $WRAP_N node(s), udp_timeout=$G_UOT_UDP_TIMEOUT)"
+fi
 __NAIVE_ORCH_FILE_5__
 
 extract_file 'root/usr/libexec/naive-orch/status' '0755' <<'__NAIVE_ORCH_FILE_6__'
@@ -1870,6 +1958,15 @@ return view.extend({
 			_('Внутренний порт naive = SOCKS-порт + это значение.'));
 		o.datatype = 'range(1,50000)';
 		o.default = '1000';
+		o.depends('udp_over_tcp', '1');
+
+		o = s.taboption('uot', form.Value, 'uot_udp_timeout', _('Таймаут UDP-сессии'),
+			_('Сколько держать простаивающую UDP-сессию (и её туннель через naive), если клиент не закрыл SOCKS-ассоциацию. Живые потоки таймер обновляют. Формат sing-box: 30s, 1m, 2m30s.'));
+		o.default = '5m';
+		o.rmempty = false;
+		o.validate = function(sectionId, value) {
+			return /^[0-9]+[smh]([0-9]+[smh])*$/.test(value) ? true : _('Ожидается длительность вида 30s, 1m или 1m30s');
+		};
 		o.depends('udp_over_tcp', '1');
 
 		/* ---------------- subscriptions: the primary setup path ---------------- */
