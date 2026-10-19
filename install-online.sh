@@ -645,8 +645,6 @@ start_service() {
 	mkdir -p "$NO_RUNDIR";    chmod 0700 "$NO_RUNDIR"
 	mkdir -p "$NO_STATUSDIR"; chmod 0700 "$NO_STATUSDIR"
 	rm -f "$NO_RUNDIR"/*.json 2>/dev/null
-	# pidfiles of the pre-v0.4 per-node wrappers (<id>-uot) are never rewritten
-	rm -f /var/run/naive-orch-*-uot.pid 2>/dev/null
 	no_is_duration "$g_uot_udp_timeout" || g_uot_udp_timeout="5m"
 
 	no_wrapper_reset
