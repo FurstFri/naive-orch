@@ -27,6 +27,7 @@ NO_HEALTHLOCK="$TEST_DIR/run/healthcheck.lock"
 NO_PERSIST="$TEST_DIR/etc"
 NO_PORTMAP="$TEST_DIR/etc/portmap"
 NO_SUBSTATE="$TEST_DIR/etc/sub-state"
+NO_SB_INIT="$TEST_DIR/etc/sing-box.init"
 
 config_load() { :; }
 config_get() {
@@ -81,6 +82,33 @@ prepare_script() {
 
 export TEST_MOCK="$TEST_DIR/mock-openwrt.sh"
 export PATH="$TEST_DIR/bin:$PATH"
+
+# --- podkop's sing-box init script gets nofile=65535 ----------------------------
+cp "$PROJECT_DIR/tests/fixtures/sing-box.init" "$TEST_DIR/etc/sing-box.init"
+chmod 0755 "$TEST_DIR/etc/sing-box.init"
+printf '%s
+' '#!/bin/sh /etc/rc.common' 'start_service() {' 	'	procd_open_instance "x"' '	procd_set_param command /bin/true' 	'	procd_close_instance' '}' > "$TEST_DIR/etc/norespawn.init"
+sh -eu -c '
+. "$1"
+f="$NO_SB_INIT"
+no_singbox_nofile_patch || { echo "stock sing-box init was not patched"; exit 1; }
+no_singbox_nofile_patch && { echo "patch is not idempotent"; exit 1; }
+[ "$(grep -c "procd_set_param limits nofile=\"65535 65535\"" "$f")" = "1" ] || { echo "limit line missing"; exit 1; }
+# the limit sits inside the instance, right before respawn, with its indentation
+awk "/limits nofile=/{l=NR; ok=(\$0 ~ /^	/)} /procd_set_param respawn/{r=NR} /procd_open_instance/{o=NR} END{exit !(ok && o < l && l < r)}" "$f" 	|| { echo "limit line misplaced"; exit 1; }
+sh -n "$f" || { echo "patched init script is not valid sh"; exit 1; }
+[ -x "$f" ] || { echo "patch dropped the executable bit"; exit 1; }
+# no respawn: falls back to just before procd_close_instance
+no_singbox_nofile_patch "$2" || { echo "script without respawn was not patched"; exit 1; }
+awk "/limits nofile=/{l=NR} /procd_close_instance/{c=NR} END{exit !(l && l < c)}" "$2" 	|| { echo "fallback placement wrong"; exit 1; }
+# nothing to patch: missing file, script without procd instances
+no_singbox_nofile_patch "$2.missing" && exit 1
+printf "#!/bin/sh
+echo hi
+" > "$2.plain"
+no_singbox_nofile_patch "$2.plain" && { echo "patched a non-procd script"; exit 1; }
+exit 0
+' sh "$TEST_MOCK" "$TEST_DIR/etc/norespawn.init"
 
 # --- UoT wrapper: one sing-box config for all nodes ---------------------------
 sh -eu -c '

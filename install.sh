@@ -8,10 +8,19 @@
 #   sh install.sh --enable   # also enable and start the service
 #   sh install.sh --enable --uot  # install sing-box and enable UDP over TCP
 #   sh install.sh --skip-naive  # do not download the official naive binary
+#   sh install.sh --no-bbr      # keep the kernel's TCP congestion control as is
 #
 # Safe by design: binds only to 127.0.0.1, the sample node is disabled,
 # nothing touches firewall / DNS / nftables. UDP over TCP is keyless: the
 # de-side receiver is a plain socks inbound reachable only through naive.
+#
+# Host tuning (each step is skipped when it does not apply):
+#   - podkop's /etc/init.d/sing-box gets nofile=65535 (stock: procd's 4096,
+#     which the main sing-box exhausts under load); with --enable a running
+#     sing-box below that limit is restarted once to pick it up
+#   - TCP congestion control is switched to BBR (kmod-tcp-bbr): every naive
+#     tunnel is one long TCP stream over a ~70 ms path, where cubic keeps the
+#     window small; --no-bbr opts out
 
 set -e
 
@@ -19,6 +28,7 @@ SRC_DIR="$(cd "$(dirname "$0")" && pwd)/root"
 ENABLE=0
 INSTALL_NAIVE="${NAIVE_ORCH_INSTALL_NAIVE:-1}"
 INSTALL_UOT="${NAIVE_ORCH_INSTALL_UOT:-0}"
+INSTALL_BBR="${NAIVE_ORCH_INSTALL_BBR:-1}"
 PKG_UPDATED=0
 
 for arg in "$@"; do
@@ -26,6 +36,7 @@ for arg in "$@"; do
 		--enable) ENABLE=1 ;;
 		--uot) INSTALL_UOT=1 ;;
 		--skip-naive) INSTALL_NAIVE=0 ;;
+		--no-bbr) INSTALL_BBR=0 ;;
 		*) echo "ERROR: unknown option: $arg" >&2; exit 2 ;;
 	esac
 done
@@ -273,6 +284,58 @@ configure_uot() {
 	chmod 0600 /etc/config/naive-orch
 }
 
+# BBR for the router's own TCP (naive tunnels, podkop's direct-out). Only the
+# congestion control is changed; qdiscs (fq_codel/SQM) stay as configured —
+# kernel BBR paces by itself and does not need fq.
+configure_bbr() {
+	local conf=/etc/sysctl.d/90-naive-orch-bbr.conf avail
+	[ "$INSTALL_BBR" = "1" ] || return 0
+	avail="$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null)"
+	case " $avail " in
+		*" bbr "*) ;;
+		*)
+			msg "==> Installing BBR congestion control (kmod-tcp-bbr)"
+			pkg_installed kmod-tcp-bbr || pkg_install kmod-tcp-bbr || {
+				warn "kmod-tcp-bbr is not available for this kernel; keeping $(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)"
+				return 0
+			}
+			modprobe tcp_bbr 2>/dev/null || true
+			;;
+	esac
+	avail="$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null)"
+	case " $avail " in
+		*" bbr "*) ;;
+		*) warn "BBR module did not load; keeping current congestion control"; return 0 ;;
+	esac
+	printf '%s\n' '# naive-orch: BBR keeps long single-stream tunnels fast on high-RTT paths' \
+		'net.ipv4.tcp_congestion_control=bbr' > "$conf"
+	sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null
+	echo "    congestion control: $(cat /proc/sys/net/ipv4/tcp_congestion_control) ($conf)"
+}
+
+# podkop's main sing-box: see no_singbox_nofile_patch in lib.sh
+configure_singbox_nofile() {
+	. /usr/libexec/naive-orch/lib.sh
+	[ "$(uci -q get naive-orch.@global[0].singbox_nofile 2>/dev/null)" = "0" ] && {
+		echo "    sing-box nofile patch disabled (global.singbox_nofile=0)"
+		return 0
+	}
+	[ -f "$NO_SB_INIT" ] || return 0
+	if no_singbox_nofile_patch; then
+		echo "    patched $NO_SB_INIT: nofile=$NO_NOFILE"
+	else
+		echo "    $NO_SB_INIT already has a nofile limit"
+	fi
+	if no_singbox_nofile_low; then
+		if [ "$ENABLE" = "1" ]; then
+			msg "==> Restarting sing-box to apply nofile=$NO_NOFILE (traffic pauses for a few seconds)"
+			"$NO_SB_INIT" restart || warn "sing-box restart failed; run: $NO_SB_INIT restart"
+		else
+			warn "the running sing-box still has the old file limit; run: $NO_SB_INIT restart"
+		fi
+	fi
+}
+
 ensure_dependencies
 download_naive
 [ "$INSTALL_UOT" = "1" ] && download_sing_box
@@ -321,6 +384,10 @@ if [ -d "$SRC_DIR/usr/share/luci" ]; then
 fi
 
 configure_uot
+
+msg "==> Tuning the router"
+configure_bbr
+configure_singbox_nofile
 
 msg "==> Checking installation"
 [ -x /usr/bin/naive ] && echo "    naive binary: OK (/usr/bin/naive)" \

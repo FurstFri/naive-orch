@@ -27,10 +27,19 @@ extract_file 'install.sh' '0755' <<'__NAIVE_ORCH_FILE_0__'
 #   sh install.sh --enable   # also enable and start the service
 #   sh install.sh --enable --uot  # install sing-box and enable UDP over TCP
 #   sh install.sh --skip-naive  # do not download the official naive binary
+#   sh install.sh --no-bbr      # keep the kernel's TCP congestion control as is
 #
 # Safe by design: binds only to 127.0.0.1, the sample node is disabled,
 # nothing touches firewall / DNS / nftables. UDP over TCP is keyless: the
 # de-side receiver is a plain socks inbound reachable only through naive.
+#
+# Host tuning (each step is skipped when it does not apply):
+#   - podkop's /etc/init.d/sing-box gets nofile=65535 (stock: procd's 4096,
+#     which the main sing-box exhausts under load); with --enable a running
+#     sing-box below that limit is restarted once to pick it up
+#   - TCP congestion control is switched to BBR (kmod-tcp-bbr): every naive
+#     tunnel is one long TCP stream over a ~70 ms path, where cubic keeps the
+#     window small; --no-bbr opts out
 
 set -e
 
@@ -38,6 +47,7 @@ SRC_DIR="$(cd "$(dirname "$0")" && pwd)/root"
 ENABLE=0
 INSTALL_NAIVE="${NAIVE_ORCH_INSTALL_NAIVE:-1}"
 INSTALL_UOT="${NAIVE_ORCH_INSTALL_UOT:-0}"
+INSTALL_BBR="${NAIVE_ORCH_INSTALL_BBR:-1}"
 PKG_UPDATED=0
 
 for arg in "$@"; do
@@ -45,6 +55,7 @@ for arg in "$@"; do
 		--enable) ENABLE=1 ;;
 		--uot) INSTALL_UOT=1 ;;
 		--skip-naive) INSTALL_NAIVE=0 ;;
+		--no-bbr) INSTALL_BBR=0 ;;
 		*) echo "ERROR: unknown option: $arg" >&2; exit 2 ;;
 	esac
 done
@@ -292,6 +303,58 @@ configure_uot() {
 	chmod 0600 /etc/config/naive-orch
 }
 
+# BBR for the router's own TCP (naive tunnels, podkop's direct-out). Only the
+# congestion control is changed; qdiscs (fq_codel/SQM) stay as configured —
+# kernel BBR paces by itself and does not need fq.
+configure_bbr() {
+	local conf=/etc/sysctl.d/90-naive-orch-bbr.conf avail
+	[ "$INSTALL_BBR" = "1" ] || return 0
+	avail="$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null)"
+	case " $avail " in
+		*" bbr "*) ;;
+		*)
+			msg "==> Installing BBR congestion control (kmod-tcp-bbr)"
+			pkg_installed kmod-tcp-bbr || pkg_install kmod-tcp-bbr || {
+				warn "kmod-tcp-bbr is not available for this kernel; keeping $(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)"
+				return 0
+			}
+			modprobe tcp_bbr 2>/dev/null || true
+			;;
+	esac
+	avail="$(cat /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null)"
+	case " $avail " in
+		*" bbr "*) ;;
+		*) warn "BBR module did not load; keeping current congestion control"; return 0 ;;
+	esac
+	printf '%s\n' '# naive-orch: BBR keeps long single-stream tunnels fast on high-RTT paths' \
+		'net.ipv4.tcp_congestion_control=bbr' > "$conf"
+	sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null
+	echo "    congestion control: $(cat /proc/sys/net/ipv4/tcp_congestion_control) ($conf)"
+}
+
+# podkop's main sing-box: see no_singbox_nofile_patch in lib.sh
+configure_singbox_nofile() {
+	. /usr/libexec/naive-orch/lib.sh
+	[ "$(uci -q get naive-orch.@global[0].singbox_nofile 2>/dev/null)" = "0" ] && {
+		echo "    sing-box nofile patch disabled (global.singbox_nofile=0)"
+		return 0
+	}
+	[ -f "$NO_SB_INIT" ] || return 0
+	if no_singbox_nofile_patch; then
+		echo "    patched $NO_SB_INIT: nofile=$NO_NOFILE"
+	else
+		echo "    $NO_SB_INIT already has a nofile limit"
+	fi
+	if no_singbox_nofile_low; then
+		if [ "$ENABLE" = "1" ]; then
+			msg "==> Restarting sing-box to apply nofile=$NO_NOFILE (traffic pauses for a few seconds)"
+			"$NO_SB_INIT" restart || warn "sing-box restart failed; run: $NO_SB_INIT restart"
+		else
+			warn "the running sing-box still has the old file limit; run: $NO_SB_INIT restart"
+		fi
+	fi
+}
+
 ensure_dependencies
 download_naive
 [ "$INSTALL_UOT" = "1" ] && download_sing_box
@@ -341,6 +404,10 @@ fi
 
 configure_uot
 
+msg "==> Tuning the router"
+configure_bbr
+configure_singbox_nofile
+
 msg "==> Checking installation"
 [ -x /usr/bin/naive ] && echo "    naive binary: OK (/usr/bin/naive)" \
 	|| warn "/usr/bin/naive is missing; nodes cannot start"
@@ -378,6 +445,10 @@ config global
 	option health_url 'https://www.gstatic.com/generate_204'
 	option check_interval '30'
 	option restart_failed '1'
+	# Keep podkop's /etc/init.d/sing-box patched with nofile=65535 (re-applied
+	# after sing-box package upgrades). At the stock 4096 the main sing-box stops
+	# accepting LAN connections under load: 'accept4: too many open files'.
+	option singbox_nofile '1'
 	# --- variant B: UDP-over-TCP (UoT), keyless ---
 	# When udp_over_tcp='1', every node's public SOCKS port is served by ONE
 	# shared sing-box wrapper (TCP -> that node's naive, UDP -> sing-box UoT v2
@@ -435,6 +506,8 @@ g_uot_port=8389
 g_uot_offset=1000
 g_uot_udp_timeout="5m"
 g_uot_gogc=""
+# keep podkop's sing-box init script patched with nofile (see lib.sh)
+g_singbox_nofile=1
 
 USED_PORTS=" "
 
@@ -450,6 +523,7 @@ load_global_section() {
 	config_get      g_uot_offset "$s" uot_offset   1000
 	config_get      g_uot_udp_timeout "$s" uot_udp_timeout "5m"
 	config_get      g_uot_gogc "$s" uot_gogc ""
+	config_get_bool g_singbox_nofile "$s" singbox_nofile 1
 }
 
 load_global() {
@@ -579,6 +653,12 @@ start_service() {
 	config_foreach start_node node
 	start_wrapper
 
+	# podkop's sing-box carries all LAN traffic; never let it run at 4096 fds.
+	# At boot this runs before sing-box (START 88 < 99), so it starts patched.
+	if [ "$g_singbox_nofile" = "1" ] && no_singbox_nofile_patch; then
+		no_log "patched $NO_SB_INIT: nofile=$NO_NOFILE (applies on the next sing-box restart)"
+	fi
+
 	# refresh the direct-list of upstream servers (loop protection helper)
 	[ -x /usr/libexec/naive-orch/sub-update ] && \
 		/usr/libexec/naive-orch/sub-update --servers-only >/dev/null 2>&1
@@ -641,16 +721,24 @@ extract_file 'root/usr/libexec/naive-orch/healthcheck' '0755' <<'__NAIVE_ORCH_FI
 config_load "$NO_CFG"
 HEALTH_URL="https://www.gstatic.com/generate_204"
 BIND="127.0.0.1"
+SINGBOX_NOFILE=1
 
 load_health_global() {
 	local section="$1"
 	config_get HEALTH_URL "$section" health_url "$HEALTH_URL"
 	config_get BIND       "$section" bind_host  "$BIND"
+	config_get_bool SINGBOX_NOFILE "$section" singbox_nofile 1
 }
 
 # Existing installations use an anonymous `config global`, while newer/manual
 # configs may name it. config_foreach handles both forms consistently.
 config_foreach load_health_global global
+
+# A sing-box package upgrade restores its stock init script (procd default of
+# 4096 fds). Re-apply the patch here so the next sing-box restart is covered.
+if [ "$SINGBOX_NOFILE" = "1" ] && no_singbox_nofile_patch; then
+	no_log "re-patched $NO_SB_INIT after it was replaced: nofile=$NO_NOFILE (applies on the next sing-box restart)"
+fi
 
 mkdir -p "$NO_STATUSDIR"; chmod 0700 "$NO_STATUSDIR"
 mkdir "$NO_HEALTHLOCK" 2>/dev/null || exit 0
@@ -762,6 +850,10 @@ NO_SUBOP="$NO_STATUSDIR/sub-update.json"
 NO_SUBLOCK="$NO_STATUSDIR/sub-update.lock"
 NO_HEALTHLOCK="$NO_STATUSDIR/healthcheck.lock"
 NO_WRAP="$NO_RUNDIR/uot.json"
+# podkop's main sing-box: its init script comes from the sing-box package
+NO_SB_INIT="/etc/init.d/sing-box"
+NO_SB_CONF="/etc/sing-box/config.json"
+NO_NOFILE=65535
 
 NO_PERSIST="/etc/naive-orch"
 NO_PORTMAP="$NO_PERSIST/portmap"
@@ -893,6 +985,75 @@ no_is_duration() {
 	esac
 }
 
+# --- podkop's main sing-box: file descriptor limit ---------------------------
+# The sing-box package's init script sets no procd limits, so the daemon runs
+# with procd's default hard nofile of 4096. podkop sends ALL LAN traffic through
+# it (tproxy + direct-out), and a burst of connections exhausts that: sing-box
+# logs "accept4: too many open files" and stops accepting new LAN connections
+# while every upstream node is healthy. naive-orch keeps that init script
+# patched. A sing-box package upgrade restores the stock script; the healthcheck
+# re-applies the patch, and the next sing-box restart (podkop restarts it on
+# every config/list change) picks it up.
+
+# Patch the init script once. Returns 0 when it changed the file (the running
+# sing-box needs a restart to get the new limit), 1 otherwise.
+no_singbox_nofile_patch() {
+	local f="${1:-$NO_SB_INIT}" tmp
+	[ -f "$f" ] || return 1
+	grep -q 'procd_set_param limits nofile=' "$f" && return 1
+	grep -q 'procd_open_instance' "$f" || return 1
+
+	# Healthcheck runs can overlap (loop + LuCI refresh): write a full copy next
+	# to the file and rename it into place, so a reader never sees a partial
+	# script. cp -p first, so the copy already has the original owner and mode.
+	tmp="$f.naive-orch.$$"
+	cp -p "$f" "$tmp" 2>/dev/null || return 1
+	# Insert right before the first `procd_set_param respawn` (or, if the script
+	# has none, before the first `procd_close_instance`), keeping its indentation.
+	awk -v n="$NO_NOFILE" '
+		!done && /^[[:space:]]*procd_set_param[[:space:]]+respawn/ { anchor = 1 }
+		!done && !seen_respawn && /^[[:space:]]*procd_close_instance/ { anchor = 1 }
+		/^[[:space:]]*procd_set_param[[:space:]]+respawn/ { seen_respawn = 1 }
+		anchor {
+			ind = $0; sub(/[^[:space:]].*$/, "", ind)
+			print ind "# naive-orch: podkop routes all LAN traffic through this daemon;"
+			print ind "# the procd default (4096) runs out under load (accept4: too many open files)"
+			print ind "procd_set_param limits nofile=\"" n " " n "\""
+			anchor = 0; done = 1
+		}
+		{ print }
+		END { if (!done) exit 1 }
+	' "$f" > "$tmp" || { rm -f "$tmp"; return 1; }
+	sh -n "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+	mv -f "$tmp" "$f" || { rm -f "$tmp"; return 1; }
+	return 0
+}
+
+# pid of podkop's main sing-box (empty when it is not running)
+no_singbox_main_pid() {
+	local p
+	for p in $(pidof sing-box 2>/dev/null); do
+		grep -q "$NO_SB_CONF" "/proc/$p/cmdline" 2>/dev/null && { echo "$p"; return 0; }
+	done
+	return 1
+}
+
+# hard "Max open files" of a pid (empty when unknown)
+no_pid_nofile() {
+	awk '/^Max open files/ { print $5; exit }' "/proc/$1/limits" 2>/dev/null
+}
+
+# Is the running main sing-box below the wanted limit? (0 = yes, needs restart)
+no_singbox_nofile_low() {
+	local p lim
+	p="$(no_singbox_main_pid)" || return 1
+	lim="$(no_pid_nofile "$p")"
+	case "$lim" in
+		''|unlimited|*[!0-9]*) return 1 ;;
+	esac
+	[ "$lim" -lt "$NO_NOFILE" ]
+}
+
 # extract the host from a naive proxy URL (https://user:pass@host:port -> host)
 no_proxy_host() {
 	local u="${1#https://}"   # strip scheme
@@ -1000,6 +1161,14 @@ awk '
 		label=""; st=""; port=""; lat=""; err=""
 	}
 ' "$NO_STATUS"
+
+if no_singbox_nofile_low; then
+	sb_pid="$(no_singbox_main_pid)"
+	echo ""
+	echo "WARNING: podkop's sing-box (pid $sb_pid) runs with nofile=$(no_pid_nofile "$sb_pid") < $NO_NOFILE."
+	echo "  Under load it stops accepting LAN connections (accept4: too many open files)."
+	echo "  Apply the patched limit: /etc/init.d/sing-box restart"
+fi
 
 if [ -f "$NO_SERVERS" ] && [ -s "$NO_SERVERS" ]; then
 	echo ""

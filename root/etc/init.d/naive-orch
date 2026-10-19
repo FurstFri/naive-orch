@@ -22,6 +22,8 @@ g_uot_port=8389
 g_uot_offset=1000
 g_uot_udp_timeout="5m"
 g_uot_gogc=""
+# keep podkop's sing-box init script patched with nofile (see lib.sh)
+g_singbox_nofile=1
 
 USED_PORTS=" "
 
@@ -37,6 +39,7 @@ load_global_section() {
 	config_get      g_uot_offset "$s" uot_offset   1000
 	config_get      g_uot_udp_timeout "$s" uot_udp_timeout "5m"
 	config_get      g_uot_gogc "$s" uot_gogc ""
+	config_get_bool g_singbox_nofile "$s" singbox_nofile 1
 }
 
 load_global() {
@@ -165,6 +168,12 @@ start_service() {
 	no_wrapper_reset
 	config_foreach start_node node
 	start_wrapper
+
+	# podkop's sing-box carries all LAN traffic; never let it run at 4096 fds.
+	# At boot this runs before sing-box (START 88 < 99), so it starts patched.
+	if [ "$g_singbox_nofile" = "1" ] && no_singbox_nofile_patch; then
+		no_log "patched $NO_SB_INIT: nofile=$NO_NOFILE (applies on the next sing-box restart)"
+	fi
 
 	# refresh the direct-list of upstream servers (loop protection helper)
 	[ -x /usr/libexec/naive-orch/sub-update ] && \

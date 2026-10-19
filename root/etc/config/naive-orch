@@ -4,6 +4,10 @@ config global
 	option health_url 'https://www.gstatic.com/generate_204'
 	option check_interval '30'
 	option restart_failed '1'
+	# Keep podkop's /etc/init.d/sing-box patched with nofile=65535 (re-applied
+	# after sing-box package upgrades). At the stock 4096 the main sing-box stops
+	# accepting LAN connections under load: 'accept4: too many open files'.
+	option singbox_nofile '1'
 	# --- variant B: UDP-over-TCP (UoT), keyless ---
 	# When udp_over_tcp='1', every node's public SOCKS port is served by ONE
 	# shared sing-box wrapper (TCP -> that node's naive, UDP -> sing-box UoT v2

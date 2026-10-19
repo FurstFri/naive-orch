@@ -12,6 +12,10 @@ NO_SUBOP="$NO_STATUSDIR/sub-update.json"
 NO_SUBLOCK="$NO_STATUSDIR/sub-update.lock"
 NO_HEALTHLOCK="$NO_STATUSDIR/healthcheck.lock"
 NO_WRAP="$NO_RUNDIR/uot.json"
+# podkop's main sing-box: its init script comes from the sing-box package
+NO_SB_INIT="/etc/init.d/sing-box"
+NO_SB_CONF="/etc/sing-box/config.json"
+NO_NOFILE=65535
 
 NO_PERSIST="/etc/naive-orch"
 NO_PORTMAP="$NO_PERSIST/portmap"
@@ -141,6 +145,75 @@ no_is_duration() {
 		''|*[!0-9smh]*|[!0-9]*|*[!smh]) return 1 ;;
 		*) return 0 ;;
 	esac
+}
+
+# --- podkop's main sing-box: file descriptor limit ---------------------------
+# The sing-box package's init script sets no procd limits, so the daemon runs
+# with procd's default hard nofile of 4096. podkop sends ALL LAN traffic through
+# it (tproxy + direct-out), and a burst of connections exhausts that: sing-box
+# logs "accept4: too many open files" and stops accepting new LAN connections
+# while every upstream node is healthy. naive-orch keeps that init script
+# patched. A sing-box package upgrade restores the stock script; the healthcheck
+# re-applies the patch, and the next sing-box restart (podkop restarts it on
+# every config/list change) picks it up.
+
+# Patch the init script once. Returns 0 when it changed the file (the running
+# sing-box needs a restart to get the new limit), 1 otherwise.
+no_singbox_nofile_patch() {
+	local f="${1:-$NO_SB_INIT}" tmp
+	[ -f "$f" ] || return 1
+	grep -q 'procd_set_param limits nofile=' "$f" && return 1
+	grep -q 'procd_open_instance' "$f" || return 1
+
+	# Healthcheck runs can overlap (loop + LuCI refresh): write a full copy next
+	# to the file and rename it into place, so a reader never sees a partial
+	# script. cp -p first, so the copy already has the original owner and mode.
+	tmp="$f.naive-orch.$$"
+	cp -p "$f" "$tmp" 2>/dev/null || return 1
+	# Insert right before the first `procd_set_param respawn` (or, if the script
+	# has none, before the first `procd_close_instance`), keeping its indentation.
+	awk -v n="$NO_NOFILE" '
+		!done && /^[[:space:]]*procd_set_param[[:space:]]+respawn/ { anchor = 1 }
+		!done && !seen_respawn && /^[[:space:]]*procd_close_instance/ { anchor = 1 }
+		/^[[:space:]]*procd_set_param[[:space:]]+respawn/ { seen_respawn = 1 }
+		anchor {
+			ind = $0; sub(/[^[:space:]].*$/, "", ind)
+			print ind "# naive-orch: podkop routes all LAN traffic through this daemon;"
+			print ind "# the procd default (4096) runs out under load (accept4: too many open files)"
+			print ind "procd_set_param limits nofile=\"" n " " n "\""
+			anchor = 0; done = 1
+		}
+		{ print }
+		END { if (!done) exit 1 }
+	' "$f" > "$tmp" || { rm -f "$tmp"; return 1; }
+	sh -n "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+	mv -f "$tmp" "$f" || { rm -f "$tmp"; return 1; }
+	return 0
+}
+
+# pid of podkop's main sing-box (empty when it is not running)
+no_singbox_main_pid() {
+	local p
+	for p in $(pidof sing-box 2>/dev/null); do
+		grep -q "$NO_SB_CONF" "/proc/$p/cmdline" 2>/dev/null && { echo "$p"; return 0; }
+	done
+	return 1
+}
+
+# hard "Max open files" of a pid (empty when unknown)
+no_pid_nofile() {
+	awk '/^Max open files/ { print $5; exit }' "/proc/$1/limits" 2>/dev/null
+}
+
+# Is the running main sing-box below the wanted limit? (0 = yes, needs restart)
+no_singbox_nofile_low() {
+	local p lim
+	p="$(no_singbox_main_pid)" || return 1
+	lim="$(no_pid_nofile "$p")"
+	case "$lim" in
+		''|unlimited|*[!0-9]*) return 1 ;;
+	esac
+	[ "$lim" -lt "$NO_NOFILE" ]
 }
 
 # extract the host from a naive proxy URL (https://user:pass@host:port -> host)

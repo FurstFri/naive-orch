@@ -39,6 +39,14 @@ awk '
 	}
 ' "$NO_STATUS"
 
+if no_singbox_nofile_low; then
+	sb_pid="$(no_singbox_main_pid)"
+	echo ""
+	echo "WARNING: podkop's sing-box (pid $sb_pid) runs with nofile=$(no_pid_nofile "$sb_pid") < $NO_NOFILE."
+	echo "  Under load it stops accepting LAN connections (accept4: too many open files)."
+	echo "  Apply the patched limit: /etc/init.d/sing-box restart"
+fi
+
 if [ -f "$NO_SERVERS" ] && [ -s "$NO_SERVERS" ]; then
 	echo ""
 	echo "Upstream servers (add to Podkop direct / direct-DNS to avoid loops):"

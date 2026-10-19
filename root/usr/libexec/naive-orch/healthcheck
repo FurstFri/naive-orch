@@ -8,16 +8,24 @@
 config_load "$NO_CFG"
 HEALTH_URL="https://www.gstatic.com/generate_204"
 BIND="127.0.0.1"
+SINGBOX_NOFILE=1
 
 load_health_global() {
 	local section="$1"
 	config_get HEALTH_URL "$section" health_url "$HEALTH_URL"
 	config_get BIND       "$section" bind_host  "$BIND"
+	config_get_bool SINGBOX_NOFILE "$section" singbox_nofile 1
 }
 
 # Existing installations use an anonymous `config global`, while newer/manual
 # configs may name it. config_foreach handles both forms consistently.
 config_foreach load_health_global global
+
+# A sing-box package upgrade restores its stock init script (procd default of
+# 4096 fds). Re-apply the patch here so the next sing-box restart is covered.
+if [ "$SINGBOX_NOFILE" = "1" ] && no_singbox_nofile_patch; then
+	no_log "re-patched $NO_SB_INIT after it was replaced: nofile=$NO_NOFILE (applies on the next sing-box restart)"
+fi
 
 mkdir -p "$NO_STATUSDIR"; chmod 0700 "$NO_STATUSDIR"
 mkdir "$NO_HEALTHLOCK" 2>/dev/null || exit 0
